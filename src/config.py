@@ -18,6 +18,8 @@ SECRET = env.str("SECRET")
 BILLZ_SECRET_KEY = env.str("BILLZ_SECRET_KEY")
 BILLZ_API_KEY = env.str("BILLZ_API_KEY")
 
+FRONTEND_BASE_URL = env.str("FRONTEND_BASE_URL")
+
 
 db: int = env.int('REDIS_DATABASE') if env.str('REDIS_DATABASE') else None
 """ Redis Database ID """
