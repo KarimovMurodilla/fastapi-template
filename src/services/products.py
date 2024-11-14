@@ -48,7 +48,7 @@ class BillzService:
 
                     if products.get(obj['parent_id']):
                         product_attributes = obj['product_attributes'][0]
-                        product_attributes['count'] = count
+                        product_attributes['max_count'] = count
                         product_attributes['product_id'] = obj['id']
                         products[obj['parent_id']]['product_attributes'].append(product_attributes)
 
