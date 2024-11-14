@@ -30,21 +30,12 @@ class BillzService:
             await client.post(url, payload)
 
     async def get_products(self, limit: int, page: int, search: str = None):
-        """
-        TODO: 
-        1. All products with parent_id
-        2. All products with main_image_url_full
-        3. All products with product_supplier_stock[0].wholesale_price
-        4. All products with shop_measurement_values[0].active_measurement_value
-        """
         url = f'https://api-admin.billz.ai/v2/products?limit=4000&page=1' 
         url += f'&search={search}' if search else ''
-
-
         
         async with self.client as client:
             data = await client.get(url)
-            products = []
+            products = {}
             for obj in data['products']:
                 if (
                     obj['parent_id'] and obj['main_image_url_full'] and 
@@ -53,15 +44,23 @@ class BillzService:
                     obj['shop_measurement_values'] and
                     obj['shop_measurement_values'][0]['active_measurement_value']
                 ):
-                    products.append(obj)
+                    count = obj['shop_measurement_values'][0]['active_measurement_value']
+
+                    if products.get(obj['parent_id']):
+                        product_attributes = obj['product_attributes'][0]
+                        product_attributes['count'] = count
+                        product_attributes['product_id'] = obj['id']
+                        products[obj['parent_id']]['product_attributes'].append(product_attributes)
+
+                    else:
+                        obj['product_attributes'][0]['max_count'] = count
+                        obj['product_attributes'][0]['product_id'] = obj['id']
+                        products[obj['parent_id']] = obj
             
             page, limit = (page - 1) * limit, (limit * page)
 
-            print("page:", page)
-            print("limit:", limit)
-            print("product len:", len(products[page:limit]))
-
             result = {}
+            products = list(products.values())
             result["count"] = len(products)
             result["products"] = products[page:limit]
 
