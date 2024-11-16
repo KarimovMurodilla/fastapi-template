@@ -29,13 +29,16 @@ class BillzService:
         async with self.client as client:
             await client.post(url, payload)
 
-    async def get_products(self, limit: int, page: int, search: str = None):
+    async def get_products(self):
         url = f'https://api-admin.billz.ai/v2/products?limit=4000&page=1' 
-        url += f'&search={search}' if search else ''
         
         async with self.client as client:
             data = await client.get(url)
             products = {}
+
+            if not data['products']:
+                return data
+            
             for obj in data['products']:
                 if (
                     obj['parent_id'] and obj['main_image_url_full'] and 
@@ -57,11 +60,4 @@ class BillzService:
                         obj['product_attributes'][0]['product_id'] = obj['id']
                         products[obj['parent_id']] = obj
             
-            page, limit = (page - 1) * limit, (limit * page)
-
-            result = {}
-            products = list(products.values())
-            result["count"] = len(products)
-            result["products"] = products[page:limit]
-
-            return result if result else result
+            return list(products.values())

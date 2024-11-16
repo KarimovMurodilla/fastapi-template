@@ -44,14 +44,14 @@ class Cache:
         return await self.client.get(str(key))
 
     @final
-    async def set(self, key: str, value: Any):
+    async def set(self, key: str, value: Any, ex: float = None):
         """
         Set a value to cache database
         :param key: Key to set
         :param value: Value in a serializable type
         :return: Nothing
         """
-        await self.client.set(name=str(key), value=value)  # noqa
+        await self.client.set(name=str(key), value=value, ex=ex)  # noqa
 
     @overload
     async def exists(self, key: str):
