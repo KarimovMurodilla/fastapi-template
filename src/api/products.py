@@ -58,6 +58,7 @@ async def get_products(
 
         products = [item for item in all_products if search.lower() in item["name"].lower()]
         result["count"] = len(products)
+        products = products[start:end]
 
     result["products"] = products
 
