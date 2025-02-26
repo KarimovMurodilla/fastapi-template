@@ -23,9 +23,22 @@ alembic revision --autogenerate --m="Initial check"
 alembic upgrade head
 ```
 
-3. Запуск (в корневом каталоге)
+С  помощью make
 ```
-python src/main.py
+make generate
+```
+```
+make migrate
+```
+
+3. Запуск (в корневом каталоге)
+* Development
+```
+fastapi dev src/main.py
+```
+* Production
+```
+fastapi run src/main.py
 ```
 > Откройте в: [localhost:8000](http://localhost:8000)
 
