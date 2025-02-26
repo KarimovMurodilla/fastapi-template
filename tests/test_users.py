@@ -1,6 +1,4 @@
 from httpx import AsyncClient
-from fastapi import Depends
-from conftest import client
 
 
 async def test_get_user(ac: AsyncClient):

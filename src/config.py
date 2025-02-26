@@ -1,32 +1,43 @@
 from pathlib import Path
-from environs import Env
+from dotenv import load_dotenv
 
-env = Env()
-env.read_env()
+from pydantic import PostgresDsn, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(override=True)
+
+class Settings(BaseSettings):
+    # Base directory
+    BASE_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parent.parent)
+    SECRET_KEY: str
+
+    # Database configurations
+    DB_HOST: str
+    DB_PORT: int
+    DB_NAME: str
+    DB_USER: str
+    DB_PASS: str
+
+    # test sqlite3 database
+    DATABASE_URL_TEST: str
+
+    @property
+    def DATABASE_URL(self) -> PostgresDsn:
+        return PostgresDsn.build(
+            scheme="postgresql+asyncpg",
+            username=self.DB_USER,
+            password=self.DB_PASS,
+            host=self.DB_HOST,
+            port=self.DB_PORT,
+            path=self.DB_NAME,
+        )
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,  # This helps with variable name matching
+        extra="ignore"
+    )
 
 
-# Actually I use postgresql in production, but in tz sayed sqlite3
-DATABASE_URL = f"sqlite+aiosqlite:///{BASE_DIR}/database.db"
-
-# Test
-DATABASE_URL_TEST = f"sqlite+aiosqlite:///{BASE_DIR}/test.db"
-
-SECRET = env.str("SECRET")
-
-BILLZ_SECRET_KEY = env.str("BILLZ_SECRET_KEY")
-BILLZ_API_KEY = env.str("BILLZ_API_KEY")
-
-FRONTEND_BASE_URL = env.str("FRONTEND_BASE_URL")
-
-
-db: int = env.int('REDIS_DATABASE') if env.str('REDIS_DATABASE') else None
-""" Redis Database ID """
-host: str = env.str('REDIS_HOST', None)
-port: int = env.int('REDIS_PORT', 6379)
-passwd: str | None = env.str('REDIS_PASSWORD', None)
-username: str | None = env.str('REDIS_USERNAME', None)
-state_ttl: int | None = env.int('REDIS_TTL_STATE', None)
-data_ttl: int | None = env.int('REDIS_TTL_DATA', None)
-
+settings = Settings()

@@ -1,9 +1,4 @@
-import datetime
-from typing import List, Optional
-
 from fastapi_users import schemas
-
-from pydantic import BaseModel
 
 
 class UserSchema(schemas.BaseUser[int]):
@@ -17,10 +12,8 @@ class UserSchema(schemas.BaseUser[int]):
     class ConfigDict:
         from_attributes = True
 
-
 class UserSchemaAdd(schemas.BaseUserCreate):
     name: str
-
 
 class UserSchemaEdit(schemas.BaseUserUpdate):
     name: str

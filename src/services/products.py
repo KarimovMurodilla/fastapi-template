@@ -1,63 +1,53 @@
 from typing import Optional
 
-from utils.custom_client import Client
+from schemas.users import UserSchemaAdd, UserSchemaEdit
+from utils.unitofwork import IUnitOfWork
+
+from fastapi_users.password import PasswordHelper, PasswordHelperProtocol
 
 
-class BillzService:
-    def __init__(self):
-        self.client = Client()
-    
-    async def set_user(
+class UsersService:
+    password_helper: PasswordHelperProtocol
+
+    def __init__(
         self,
-        chat_id: str,
-        first_name: str, 
-        last_name: str, 
-        phone_number: str, 
-        date_of_birth: Optional[str] = '2022-05-14',
-        gender: Optional[int] = 1,
+        password_helper: Optional[PasswordHelperProtocol] = None,
     ):
-        url = 'https://api-admin.billz.ai/v1/client'
-        payload = {
-            "chat_id": chat_id,
-            "date_of_birth": date_of_birth,
-            "first_name": first_name,
-            "last_name": last_name,
-            "phone_number": phone_number,
-            "gender": gender
-        }
+        if password_helper is None:
+            self.password_helper = PasswordHelper()
+        else:
+            self.password_helper = password_helper  # pragma: no cover
 
-        async with self.client as client:
-            await client.post(url, payload)
-
-    async def get_products(self):
-        url = f'https://api-admin.billz.ai/v2/products?limit=4000&page=1' 
+    async def add_user(self, uow: IUnitOfWork, user: UserSchemaAdd):
+        user_dict = user.model_dump()
+        async with uow:
+            await uow.users.add_one(user_dict)
+            await uow.commit()
         
-        async with self.client as client:
-            data = await client.get(url)
-            products = {}
+    async def get_user(self, uow: IUnitOfWork, **filters: dict):
+        async with uow:
+            user = await uow.users.find_one(**filters)
+            return user
 
-            if not data['products']:
-                return data
-            
-            for obj in data['products']:
-                if (
-                    obj['parent_id'] and obj['main_image_url_full'] and 
-                    obj['product_supplier_stock'] and 
-                    obj['product_supplier_stock'][0]['wholesale_price'] and 
-                    obj['shop_measurement_values'] and
-                    obj['shop_measurement_values'][0]['active_measurement_value']
-                ):
-                    count = obj['shop_measurement_values'][0]['active_measurement_value']
+    async def get_all_users(self, uow: IUnitOfWork):
+        async with uow:
+            users = await uow.users.find_all()
+            return users
 
-                    if products.get(obj['parent_id']):
-                        product_attributes = obj['product_attributes'][0]
-                        product_attributes['max_count'] = count
-                        product_attributes['product_id'] = obj['id']
-                        products[obj['parent_id']]['product_attributes'].append(product_attributes)
+    async def filter_users(self, uow: IUnitOfWork, **filters: dict):
+        async with uow:
+            users = await uow.users.find_all_by(**filters)
+            return users
+        
+    async def edit_user(self, uow: IUnitOfWork, id: int, user: UserSchemaEdit):
+        async with uow:
+            user_dict = user.model_dump()
+            password = user_dict.pop("password")
+            user_dict["hashed_password"] = self.password_helper.hash(password)
+            await uow.users.edit_one(id=id, data=user_dict)
+            await uow.commit()
 
-                    else:
-                        obj['product_attributes'][0]['max_count'] = count
-                        obj['product_attributes'][0]['product_id'] = obj['id']
-                        products[obj['parent_id']] = obj
-            
-            return list(products.values())
+    async def delete_user(self, uow: IUnitOfWork, id: int):
+        async with uow:
+            await uow.users.delete_one(id=id)
+            await uow.commit()

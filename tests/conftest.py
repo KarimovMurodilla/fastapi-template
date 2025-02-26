@@ -9,14 +9,13 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 from db.db import get_async_session, Base
-from src.utils.unitofwork import UnitOfWork
 from src.api.dependencies import uow
 
 from src.main import app
-from src.config import DATABASE_URL_TEST
+from src.config import settings
 
 
-engine_test = create_async_engine(DATABASE_URL_TEST, poolclass=NullPool)
+engine_test = create_async_engine(settings.DATABASE_URL_TEST, poolclass=NullPool)
 async_session_maker = sessionmaker(engine_test, class_=AsyncSession, expire_on_commit=False)
 metadata = Base.metadata
 metadata.bind = engine_test

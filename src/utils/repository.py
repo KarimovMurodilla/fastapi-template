@@ -21,16 +21,14 @@ class SQLAlchemyRepository(AbstractRepository):
         self.session = session
 
     async def add_one(self, data: dict) -> int:
-        stmt = insert(self.model).values(**data) # sqlite3 doesn't support .returning(self.model.id)
+        stmt = insert(self.model).values(**data).returning(self.model.id)
         res = await self.session.execute(stmt)
-        # return res.scalar_one()
-        return 'ok'
+        return res.scalar_one()
 
     async def edit_one(self, id: int, data: dict) -> int:
-        stmt = update(self.model).values(**data).filter_by(id=id) # sqlite3 doesn't support .returning(self.model.id)
+        stmt = update(self.model).values(**data).filter_by(id=id).returning(self.model.id)
         res = await self.session.execute(stmt)
-        # return res.scalar_one()
-        return 'ok'
+        return res.scalar_one()
     
     async def find_all(self):
         stmt = select(self.model)
@@ -55,7 +53,6 @@ class SQLAlchemyRepository(AbstractRepository):
         return res
 
     async def delete_one(self, **filters: dict) -> int:
-        stmt = delete(self.model).filter_by(**filters) # sqlite3 doesn't support .returning(self.model.id)
+        stmt = delete(self.model).filter_by(**filters).returning(self.model.id)
         res = await self.session.execute(stmt)
-        # return res.scalar_one()
-        return 'ok'
+        return res.scalar_one()

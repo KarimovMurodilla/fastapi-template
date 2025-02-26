@@ -1,16 +1,28 @@
 version: "3.7"
 
 services:
-  redis:
-    image: redis:7
-    container_name: alola_api_redis_app
+  db:
+    image: postgres:12.15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    container_name: fastapi_app_db
+    command: -p 5434
+    expose:
+      - 5434
+    env_file:
+      - .env-non-dev
 
   app:
     build:
       context: .
     env_file:
       - .env-non-dev
-    container_name: alola_api_app
+    container_name: fastapi_app
     command: ["/fastapi_app/docker/app.sh"]
     ports:
-      - 4765:8000
+      - 9999:8000
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:
