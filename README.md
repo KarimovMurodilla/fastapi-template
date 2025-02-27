@@ -40,13 +40,10 @@ fastapi dev src/main.py
 ```
 fastapi run src/main.py
 ```
-> Откройте в: [localhost:8000](http://localhost:8000)
-
 
 ## Запуск тестов
-Для тестов использовал [Pytest](https://pypi.org/project/pytest/)
+Тесты с использованием [Pytest](https://pypi.org/project/pytest/)
 1. Запуск тестов (в корневом каталоге)
 ```
 pytest -v tests/
 ```
-
