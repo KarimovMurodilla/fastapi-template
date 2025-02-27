@@ -1,49 +1,64 @@
-# О проекте
-Простая API для CRUD запросов на [FastAPI](https://github.com/tiangolo/fastapi).
-В этом проекте использован паттерн [Unit of work](https://en.wikipedia.org/wiki/Unit_of_work)
+# FastAPI Project Template
+A production-ready FastAPI boilerplate featuring robust authentication with [FastAPI-Users](https://fastapi-users.github.io/fastapi-users/) and clean architecture using the [Unit of Work](https://en.wikipedia.org/wiki/Unit_of_work) pattern.
 
-## Запуск приложения
+## Getting Started
 
-### С помощью docker-compose 
-```
+### Quick Start with Docker
+```bash
 docker-compose up --build
 ```
-> Откройте в: [0.0.0.0:9999](http://0.0.0.0:9999)
+The application will be available at [http://0.0.0.0:9999](http://0.0.0.0:9999)
 
-### С помощью python
-1. Установка модулей
-```
+### Manual Setup with Python
+
+#### 1. Install Dependencies
+```bash
 pip install -r requirements.txt
 ```
-2. Миграции
-```
-alembic revision --autogenerate --m="Initial check"
-```
-```
+
+#### 2. Database Migrations
+Using Alembic directly:
+```bash
+# Generate migration
+alembic revision --autogenerate -m "Initial check"
+
+# Apply migration
 alembic upgrade head
 ```
 
-С  помощью make
-```
+Or using Make commands:
+```bash
+# Generate migration
 make generate
-```
-```
+
+# Apply migration
 make migrate
 ```
 
-3. Запуск (в корневом каталоге)
-* Development
-```
+#### 3. Run the Application
+From the root directory:
+
+**Development Mode**
+```bash
 fastapi dev src/main.py
 ```
-* Production
-```
+
+**Production Mode**
+```bash
 fastapi run src/main.py
 ```
 
-## Запуск тестов
-Тесты с использованием [Pytest](https://pypi.org/project/pytest/)
-1. Запуск тестов (в корневом каталоге)
-```
+## Testing
+Used [Pytest](https://pypi.org/project/pytest/) for testing.
+
+Run tests from the root directory:
+```bash
 pytest -v tests/
 ```
+
+## Features
+- User authentication with FastAPI-Users
+- SQLAlchemy with Unit of Work pattern
+- Alembic migrations
+- Docker support
+- Comprehensive test coverage
