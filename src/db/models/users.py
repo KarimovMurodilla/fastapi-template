@@ -1,7 +1,6 @@
+from fastapi_users.db import SQLAlchemyBaseUserTable
 from sqlalchemy import String
 from sqlalchemy.orm import Mapped, mapped_column
-
-from fastapi_users.db import SQLAlchemyBaseUserTable
 
 from db.db import Base
 from schemas.users import UserSchema

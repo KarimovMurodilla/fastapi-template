@@ -6,7 +6,6 @@ from fastapi import APIRouter
 
 from api.dependencies import UOWDep
 
-
 router = APIRouter(
     prefix="/users",
     tags=["Users"],

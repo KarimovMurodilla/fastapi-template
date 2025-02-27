@@ -1,9 +1,9 @@
 from typing import Optional
 
+from fastapi_users.password import PasswordHelper, PasswordHelperProtocol
+
 from schemas.users import UserSchemaAdd, UserSchemaEdit
 from utils.unitofwork import IUnitOfWork
-
-from fastapi_users.password import PasswordHelper, PasswordHelperProtocol
 
 
 class UsersService:

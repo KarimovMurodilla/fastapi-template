@@ -1,7 +1,7 @@
 from pathlib import Path
-from dotenv import load_dotenv
 
-from pydantic import PostgresDsn, Field
+from dotenv import load_dotenv
+from pydantic import Field, PostgresDsn
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 load_dotenv(override=True)

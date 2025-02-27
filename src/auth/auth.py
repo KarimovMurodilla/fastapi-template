@@ -1,8 +1,7 @@
-from fastapi_users.authentication import BearerTransport, AuthenticationBackend
-from fastapi_users.authentication import JWTStrategy
+from fastapi_users.authentication import (AuthenticationBackend,
+                                          BearerTransport, JWTStrategy)
 
 from config import settings
-
 
 bearer_transport = BearerTransport(tokenUrl="auth/jwt/login")
 
