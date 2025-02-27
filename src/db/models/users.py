@@ -6,6 +6,7 @@ from fastapi_users.db import SQLAlchemyBaseUserTable
 from db.db import Base
 from schemas.users import UserSchema
 
+
 class User(SQLAlchemyBaseUserTable[int], Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -17,5 +18,5 @@ class User(SQLAlchemyBaseUserTable[int], Base):
             email=self.email,
             is_active=self.is_active,
             is_superuser=self.is_superuser,
-            is_verified=self.is_verified
+            is_verified=self.is_verified,
         )

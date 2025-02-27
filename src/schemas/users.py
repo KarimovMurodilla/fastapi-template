@@ -12,8 +12,10 @@ class UserSchema(schemas.BaseUser[int]):
     class ConfigDict:
         from_attributes = True
 
+
 class UserSchemaAdd(schemas.BaseUserCreate):
     name: str
+
 
 class UserSchemaEdit(schemas.BaseUserUpdate):
     name: str

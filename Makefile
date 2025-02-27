@@ -11,3 +11,10 @@ generate:
 .PHONY: migrate
 migrate:
 	python -m alembic upgrade head
+
+
+# Tests
+.PHONY: test
+test:
+	pytest -v tests/
+

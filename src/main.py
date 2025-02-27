@@ -3,9 +3,7 @@ import uvicorn
 from fastapi import FastAPI
 from api.routers import all_routers
 
-app = FastAPI(
-    title="Users"
-)
+app = FastAPI(title="Users")
 
 for router in all_routers:
     if isinstance(router, dict):

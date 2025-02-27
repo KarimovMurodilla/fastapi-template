@@ -23,7 +23,7 @@ class UsersService:
         async with uow:
             await uow.users.add_one(user_dict)
             await uow.commit()
-        
+
     async def get_user(self, uow: IUnitOfWork, **filters: dict):
         async with uow:
             user = await uow.users.find_one(**filters)
@@ -38,7 +38,7 @@ class UsersService:
         async with uow:
             users = await uow.users.find_all_by(**filters)
             return users
-        
+
     async def edit_user(self, uow: IUnitOfWork, id: int, user: UserSchemaEdit):
         async with uow:
             user_dict = user.model_dump()

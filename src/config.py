@@ -6,9 +6,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 load_dotenv(override=True)
 
+
 class Settings(BaseSettings):
     # Base directory
-    BASE_DIR: Path = Field(default_factory=lambda: Path(__file__).resolve().parent.parent)
+    BASE_DIR: Path = Field(
+        default_factory=lambda: Path(__file__).resolve().parent.parent
+    )
     SECRET_KEY: str
 
     # Database configurations
@@ -36,7 +39,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,  # This helps with variable name matching
-        extra="ignore"
+        extra="ignore",
     )
 
 

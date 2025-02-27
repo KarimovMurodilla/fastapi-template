@@ -8,7 +8,7 @@ class AbstractRepository(ABC):
     @abstractmethod
     async def add_one():
         raise NotImplementedError
-    
+
     @abstractmethod
     async def find_all():
         raise NotImplementedError
@@ -26,22 +26,24 @@ class SQLAlchemyRepository(AbstractRepository):
         return res.scalar_one()
 
     async def edit_one(self, id: int, data: dict) -> int:
-        stmt = update(self.model).values(**data).filter_by(id=id).returning(self.model.id)
+        stmt = (
+            update(self.model).values(**data).filter_by(id=id).returning(self.model.id)
+        )
         res = await self.session.execute(stmt)
         return res.scalar_one()
-    
+
     async def find_all(self):
         stmt = select(self.model)
         res = await self.session.execute(stmt)
         res = [row[0].to_read_model() for row in res.all()]
         return res
-    
+
     async def find_all_by(self, **filters: dict):
         stmt = select(self.model).filter_by(**filters)
         res = await self.session.execute(stmt)
         res = [row[0].to_read_model() for row in res.all()]
         return res
-    
+
     async def find_one(self, **filters: dict):
         stmt = select(self.model).filter_by(**filters)
         res = await self.session.execute(stmt)
@@ -49,7 +51,7 @@ class SQLAlchemyRepository(AbstractRepository):
 
         if res:
             res = res.to_read_model()
-            
+
         return res
 
     async def delete_one(self, **filters: dict) -> int:
