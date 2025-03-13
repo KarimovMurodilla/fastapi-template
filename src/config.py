@@ -15,11 +15,11 @@ class Settings(BaseSettings):
     SECRET_KEY: str
 
     # Database configurations
-    DB_HOST: str
-    DB_PORT: int
-    DB_NAME: str
-    DB_USER: str
-    DB_PASS: str
+    POSTGRES_HOST: str
+    POSTGRES_PORT: int
+    POSTGRES_DATABASE: str
+    POSTGRES_USER: str
+    POSTGRES_PASSWORD: str
 
     # test sqlite3 database
     DATABASE_URL_TEST: str
@@ -28,11 +28,11 @@ class Settings(BaseSettings):
     def DATABASE_URL(self) -> PostgresDsn:
         return PostgresDsn.build(
             scheme="postgresql+asyncpg",
-            username=self.DB_USER,
-            password=self.DB_PASS,
-            host=self.DB_HOST,
-            port=self.DB_PORT,
-            path=self.DB_NAME,
+            username=self.POSTGRES_USER,
+            password=self.POSTGRES_PASSWORD,
+            host=self.POSTGRES_HOST,
+            port=self.POSTGRES_PORT,
+            path=self.POSTGRES_DATABASE,
         )
 
     model_config = SettingsConfigDict(
