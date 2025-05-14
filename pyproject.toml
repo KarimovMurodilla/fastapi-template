@@ -4,3 +4,13 @@ pythonpath = [
 ]
 asyncio_mode="auto"
 asyncio_default_fixture_loop_scope="session"
+
+[tool.ruff]
+lint.select = [
+  "Q",     # Quote consistency
+  "F",     # Pyflakes
+  "E",     # Pycodestyle errors
+  "W",     # Pycodestyle warnings
+  "I",     # Import sorting
+]
+line-length = 88
