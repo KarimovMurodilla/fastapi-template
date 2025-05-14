@@ -62,3 +62,6 @@ pytest -v tests/
 - Alembic migrations
 - Docker support
 - Comprehensive test coverage
+- Ruff support
+- Pre-commit hooks
+- Makefile for common tasks
