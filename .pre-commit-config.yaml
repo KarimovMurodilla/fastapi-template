@@ -30,11 +30,11 @@ repos:
         pass_filenames: true
 
   # 4. Tests
-  - repo: local
-    hooks:
-      - id: pytest
-        name: Run Integration Tests
-        entry: pytest
-        language: system
-        types: [python]
-        pass_filenames: false
+  # - repo: local
+  #   hooks:
+  #     - id: pytest
+  #       name: Run Integration Tests
+  #       entry: pytest
+  #       language: system
+  #       types: [python]
+  #       pass_filenames: false

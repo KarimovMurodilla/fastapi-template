@@ -2,8 +2,8 @@ from fastapi_users import FastAPIUsers
 
 from auth.auth import auth_backend
 from auth.manager import get_user_manager
-from db.models.users import User
-from schemas.users import UserSchema, UserSchemaAdd
+from db.models.user import User
+from schemas.user import UserSchema, UserSchemaAdd
 
 fastapi_users = FastAPIUsers[User, int](
     get_user_manager,
