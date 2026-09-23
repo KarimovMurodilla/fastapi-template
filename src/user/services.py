@@ -1,4 +1,5 @@
-from src.core.schemas import Base
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from src.core.services import BaseService
 from src.user.auth.schemas import CreateUserModel
 from src.user.models import User
@@ -7,10 +8,11 @@ from src.user.schemas import UserSummaryViewModel
 
 
 class UserService(
-    BaseService[User, CreateUserModel, Base, UserRepository, UserSummaryViewModel]
+    BaseService[User, CreateUserModel, UserRepository, UserSummaryViewModel]
 ):
     def __init__(
         self,
         repository: UserRepository,
+        session: AsyncSession,
     ):
-        super().__init__(repository, response_schema=UserSummaryViewModel)
+        super().__init__(repository, session, response_schema=UserSummaryViewModel)

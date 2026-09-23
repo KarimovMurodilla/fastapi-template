@@ -1,9 +1,25 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
 .Python
 .env
 .venv
-*.log
+**/*.log
+logs/
 .git
+
+# Runtime code only: tests run on the host, so keep dev tooling, tests, docs,
+# caches and the test env file out of the image.
+.env.test
+.idea/
+.vscode/
+.claude/
+tests/
+docs/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+coverage.xml
+.coverage
+htmlcov/

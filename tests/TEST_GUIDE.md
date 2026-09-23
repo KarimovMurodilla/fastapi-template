@@ -9,7 +9,7 @@ The goal is simple: write solid tests quickly and consistently, without tying th
 - One test - one scenario.
 - Tests should be deterministic, isolated, and easy to read.
 - Do not duplicate business logic inside tests.
-- For unit and API integration tests in this template, avoid real external systems (network, Redis, S3, DB).
+- For unit and API integration tests in this template, avoid real external systems (network, Redis, S3, DB). The one exception is `tests/integration/`, which exists precisely to reach a real database - see section 6.
 
 ## 2) Required workflow
 
@@ -33,10 +33,18 @@ The goal is simple: write solid tests quickly and consistently, without tying th
 
 ## 3) Structure and naming
 
-- Test paths should mirror the domain structure under `src/`.
+- Application code from `src/` should be tested under `tests/unit/src/` with a mirrored path.
+- `tests/unit/src/note/` is the reference suite for a new domain module - the same
+  role `src/note/` plays for the code: CRUD, ownership and list-query coverage
+  with no auth-specific baggage.
+- Tests that need a live PostgreSQL live under `tests/integration/src/` with the same mirrored path; see section 6 for what qualifies.
+- Non-application test tooling and infrastructure checks should live under `tests/unit/` outside `src/`.
 - File names: `test_<feature>.py`.
 - Test names: `test_<scenario>_<expected_result>`.
-- For async tests, use `@pytest.mark.asyncio`.
+- Async tests need no marker: `pytest.ini` sets `asyncio_mode = auto`, so a bare
+  `async def test_...` runs as-is. Integration modules still declare
+  `pytestmark = pytest.mark.asyncio(loop_scope="session")` - for the loop scope,
+  not to enable async (see section 6).
 - Do not pack too many scenarios into one test.
 
 ## 4) Test design rules
@@ -59,7 +67,7 @@ Then: <expected result>
 """
 ```
 - Typical places where docstrings are often required: auth/user domain flows, business use cases/services, policy-heavy unhappy paths.
-- Typical places where docstrings are usually not allowed: low-level `tests/core/*`, `tests/main/*`, `tests/storage/*`, `tests/email/*`, `tests/system/*`, and trivial mapping/wiring tests.
+- Typical places where docstrings are usually not allowed: low-level `tests/unit/src/core/*`, `tests/unit/src/main/*`, `tests/unit/src/system/*`, and trivial mapping/wiring tests.
 - Quality bar for GWT docstrings:
 - The docstring must add information that is not already obvious from the test name.
 - `Given` describes domain context, not mocks/internal setup.
@@ -93,7 +101,7 @@ Then: all user sessions are invalidated and UnauthorizedException is raised.
 Core fixtures live in `tests/conftest.py`.
 
 - `app` - FastAPI application
-- `async_client` - HTTPX AsyncClient for `app`
+- `async_client` - httpx2 AsyncClient for `app`
 - `dependency_overrides` - safe setup/reset for DI overrides
 - `settings` - test `Config` from `get_settings` (used by app overrides)
 - `fake_redis` - in-memory Redis
@@ -109,13 +117,54 @@ Also available:
 - `tests/factories/` - test data factories
 - `tests/helpers/` - helpers for overrides, request building, limiter utilities
 
-## 6) Minimal unit test template
+Current application test layout:
+- `tests/unit/src/core/...`
+- `tests/unit/src/main/...`
+- `tests/unit/src/system/...`
+- `tests/unit/src/user/...`
+
+## 6) Integration suite (real PostgreSQL)
+
+`tests/integration/` is the only place that talks to a live database. It covers the SQL
+boundary - behaviour that belongs to PostgreSQL rather than to the Python around it, and
+that a fake can therefore only pretend to have:
+
+- the Alembic chain applying to an empty database, and models not drifting from migrations;
+- transactional semantics: what a commit makes durable, what a rollback discards, and the
+  UoW commit guard on a session where a stray COMMIT would be irreversible;
+- advisory locks, where a second connection contending for the key is the whole point;
+- the SQL `ListQuery` builds - `ilike` search, soft-delete filtering, and the primary-key
+  tiebreaker that keeps limit/offset pages disjoint over a non-unique sort column;
+- the transactional outbox, whose guarantee is that the row shares the caller's transaction.
+
+Everything else stays a unit test. If a fake session can answer the question, the question
+does not belong here: this suite needs Docker, so every test added to it is one the default
+`make test` cannot run.
+
+Running it: `make test-integration` starts a throwaway PostgreSQL
+(`infra/docker-compose.test.yml` - its own compose project, an ephemeral host port and no
+volume, so it never touches the dev stack), applies the migrations and runs the suite.
+`make test-all` runs unit then integration. CI runs it as the `integration-tests` job.
+
+Fixtures in `tests/integration/conftest.py`:
+
+- `migrated_database` - `alembic upgrade head`, once per session
+- `integration_engine` - session-scoped `AsyncEngine` against the test database
+- `db_session` - per-test session, rolled back afterwards
+
+Rules specific to this suite:
+
+- Every test module declares `pytestmark = pytest.mark.asyncio(loop_scope="session")`: the
+  engine is session-scoped, and an asyncpg connection cannot cross event loops. The
+  `integration` marker itself is applied by location, so it cannot be forgotten.
+- Prefer `db_session` - its rollback is what keeps tests from seeing each other's rows. A
+  test that has to commit deletes what it committed.
+- Scope queries with a per-test unique marker (`uuid4().hex[:8]`); the database is shared
+  by the whole session, and `users` carries partial unique indexes on email and username.
+
+## 7) Minimal unit test template
 
 ```python
-import pytest
-
-
-@pytest.mark.asyncio
 async def test_execute_with_valid_input_returns_expected_result(fake_uow):
     # Given
     usecase = ...
@@ -129,16 +178,12 @@ async def test_execute_with_valid_input_returns_expected_result(fake_uow):
     fake_uow.commit.assert_awaited_once()
 ```
 
-## 7) Minimal API test template
+## 8) Minimal API test template
 
 ```python
-import pytest
-
-
-@pytest.mark.asyncio
 async def test_get_resource_returns_200(async_client_with_fakes):
     # When
-    response = await async_client_with_fakes.get("/api/v1/resource")
+    response = await async_client_with_fakes.get("/v1/resource")
 
     # Then
     assert response.status_code == 200
@@ -146,7 +191,7 @@ async def test_get_resource_returns_200(async_client_with_fakes):
     assert "data" in payload
 ```
 
-## 8) Quality checklist before finishing
+## 9) Quality checklist before finishing
 
 - Happy path is covered.
 - At least one error path is covered.
@@ -157,22 +202,24 @@ async def test_get_resource_returns_200(async_client_with_fakes):
 - Style and naming are consistent.
 - Relevant test scope was executed locally.
 
-## 9) Run commands
+## 10) Run commands
 
-- Run all tests: `make test`
-- Run one file: `TESTING=true python -m pytest tests/<path>/test_<name>.py -v`
-- Run one test: `TESTING=true python -m pytest tests/<path>/test_<name>.py::test_<scenario> -v`
-- Stop on first failure: `TESTING=true python -m pytest tests/<path> -x`
-- Re-run only failed tests: `TESTING=true python -m pytest tests/<path> --lf`
+- Run all unit tests: `make test` (integration tests are deselected by default, so no Docker is needed)
+- Run the integration suite: `make test-integration` (needs Docker)
+- Run both: `make test-all`
+- Run one file: `TESTING=true python -m pytest tests/unit/src/<module>/test_<name>.py -v`
+- Run one test: `TESTING=true python -m pytest tests/unit/src/<module>/test_<name>.py::test_<scenario> -v`
+- Stop on first failure: `TESTING=true python -m pytest tests/unit/src/<module> -x`
+- Re-run only failed tests: `TESTING=true python -m pytest tests/unit/src/<module> --lf`
 
-## 10) Anti-patterns (do not do this)
+## 11) Anti-patterns (do not do this)
 
 - Testing private internals instead of the public contract.
 - Making network calls in unit tests.
 - Using uncontrolled randomness (flake-prone tests).
 - Mixing multiple business scenarios in one test.
 
-## 11) Expected output format for test work
+## 12) Expected output format for test work
 
 When adding tests, always include:
 

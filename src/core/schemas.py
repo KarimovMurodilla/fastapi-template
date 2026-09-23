@@ -1,7 +1,11 @@
 from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
 
 from src.core.utils.security import normalize_email
-from src.core.validations import STRONG_PASSWORD_VALIDATOR
+from src.core.validations import (
+    PASSWORD_MAX_LENGTH,
+    PASSWORD_MIN_LENGTH,
+    STRONG_PASSWORD_VALIDATOR,
+)
 
 
 class Base(BaseModel):
@@ -16,11 +20,23 @@ class SuccessResponse(Base):
 
 class TokenModel(Base):
     access_token: str
-    refresh_token: str
+    # None when the refresh token was delivered as an httponly cookie instead.
+    # Use cases always populate it; TokenCookieResponder strips it at the HTTP edge.
+    refresh_token: str | None = None
+    # Populated by TokenCookieResponder only under the cookie transport, so that a
+    # cross-origin SPA - which cannot read the API-origin csrf_token cookie from JS -
+    # still has a way to obtain the value it must echo in X-CSRF-Token. None under
+    # the body transport, where no cookies are written and no CSRF check applies.
+    csrf_token: str | None = None
 
 
 class EmailNormalizationMixin(BaseModel):
-    @field_validator("email", mode="before", check_fields=False)
+    # The validator binds to these literal names. A model that calls its field
+    # anything else inherits the mixin and gets no normalization at all, with
+    # nothing to notice: the address reaches the database in whatever case it
+    # arrived, so a uniqueness check and every later lookup miss each other.
+    # Add the name here rather than writing a second validator downstream.
+    @field_validator("email", "new_email", mode="before", check_fields=False)
     @classmethod
     def _normalize_email(cls, v: str | EmailStr) -> str:
         return normalize_email(str(v))
@@ -32,6 +48,6 @@ class StrongPasswordValidationMixin(BaseModel):
     def validate_password(cls, value: str) -> str:
         if not STRONG_PASSWORD_VALIDATOR.match(value):
             raise ValueError(
-                "Password must contain at least one lowercase letter, one uppercase letter, one digit, one special character. Minimum length is 8 characters"
+                f"Password must be {PASSWORD_MIN_LENGTH}-{PASSWORD_MAX_LENGTH} characters long and contain at least one lowercase letter, one uppercase letter, one digit, and one non-alphanumeric non-space character. Printable ASCII characters are allowed."
             )
         return value

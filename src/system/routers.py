@@ -1,27 +1,43 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Annotated
 
-from src.core.database.session import get_session
+from fastapi import APIRouter, Depends
+
 from src.core.utils.datetime_utils import get_utc_now
-from src.system.dependencies import get_health_service
-from src.system.schemas import HealthCheckResponse
-from src.system.services import HealthService
+from src.system.dependencies import get_health_service, get_readiness_service
+from src.system.schemas import HealthCheckResponse, ProbeResponse, ServerTimeResponse
+from src.system.services import HealthService, ReadinessService
 
 router = APIRouter()
+
+
+@router.get("/live/", response_model=ProbeResponse)
+@router.head("/live/", response_model=ProbeResponse, include_in_schema=False)
+async def check_liveness() -> ProbeResponse:
+    """Liveness probe: answers as long as the process itself is running."""
+    return ProbeResponse()
+
+
+@router.get("/ready/", response_model=ProbeResponse)
+@router.head("/ready/", response_model=ProbeResponse, include_in_schema=False)
+async def check_readiness(
+    readiness_service: Annotated[ReadinessService, Depends(get_readiness_service)],
+) -> ProbeResponse:
+    """Readiness probe: reports whether the service can reach its database."""
+    await readiness_service.ensure_ready()
+    return ProbeResponse()
 
 
 @router.get("/health/", response_model=HealthCheckResponse)
 @router.head("/health/", response_model=HealthCheckResponse, include_in_schema=False)
 async def check_health(
-    health_service: HealthService = Depends(get_health_service),
-    session: AsyncSession = Depends(get_session),
+    health_service: Annotated[HealthService, Depends(get_health_service)],
 ) -> HealthCheckResponse:
-    """Health check endpoint that verifies the service and dependencies are running."""
-    return await health_service.get_status(session=session)
+    """Detailed health report with the status of every dependency."""
+    return await health_service.get_status()
 
 
-@router.get("/time/", response_model=dict)
-def get_utc_time() -> dict[str, str]:
-    """Endpoint to get the current UTC time in ISO format."""
+@router.get("/time/", response_model=ServerTimeResponse)
+def get_utc_time() -> ServerTimeResponse:
+    """Returns the current server time in UTC, ISO 8601 format."""
     now = get_utc_now()
-    return {"time": now.replace(microsecond=0).isoformat()}
+    return ServerTimeResponse(time=now.replace(microsecond=0).isoformat())

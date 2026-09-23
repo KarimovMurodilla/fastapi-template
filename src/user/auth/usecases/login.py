@@ -1,77 +1,103 @@
-from uuid import uuid4
+from functools import partial
+from typing import Annotated
 
 from fastapi import Depends
 from redis.asyncio import Redis
 
 from loggers import get_logger
+from src.core.auth.errors import InvalidCredentialsError
+from src.core.auth.session_issuance import LoginThrottle, issue_session_pair
+from src.core.cache.interface import Cache
+from src.core.cache.runtime import get_cache
 from src.core.database.session import get_unit_of_work
-from src.core.database.uow import ApplicationUnitOfWork, RepositoryProtocol
-from src.core.errors.exceptions import (
-    InstanceProcessingException,
-    PermissionDeniedException,
-)
+from src.core.database.uow import ApplicationUnitOfWork
 from src.core.redis.dependencies import get_redis_client
 from src.core.schemas import TokenModel
 from src.core.utils.security import (
+    DUMMY_PASSWORD_HASH,
     hash_password,
     mask_email,
     needs_password_rehash,
     verify_password,
 )
+from src.event_log.actor import Actor
+from src.user.auth.realm import USER_AUTH_REALM
 from src.user.auth.schemas import LoginUserModel
-from src.user.auth.security import create_access_token, create_refresh_token
+from src.user.cache_keys import user_cache_keys
+from src.user.events import UserSignedIn, UserSignInFailed
 from src.user.models import User
+from src.user.policies import (
+    INVALID_CREDENTIALS_MESSAGE,
+    account_access_violation,
+    ensure_can_authenticate,
+)
 
-INVALID_CREDENTIALS_MESSAGE = "Incorrect email or password."
-INVALID_CREDENTIALS_PASSWORD_HASH = hash_password("dummy-password")
 logger = get_logger(__name__)
+
+# Soft per-email throttle: window-scoped counter, no permanent lockout. The
+# threshold is far above any legitimate retry pattern, so only distributed
+# credential stuffing reaches it; per-IP limiting alone cannot see that attack.
+# Deliberate trade-off: anyone who knows the email can fill the window with
+# wrong passwords and block login for its remainder. The escape hatch is the
+# password-reset flow, which proves mailbox ownership and clears the counter.
+LOGIN_FAILURES_LIMIT = 25
+LOGIN_FAILURES_WINDOW_SECONDS = 15 * 60
 
 
 class LoginUserUseCase:
     """
-    Log in a user and return access and refresh tokens.
+    Log in a user and issue an access and refresh token pair.
 
-    Inputs:
-    - data: LoginUserModel containing email and password.
+    The per-email failure counter is checked before any database or password
+    hash work, so a flood of guesses costs one Redis read each. An unknown
+    email is still verified against a dummy hash, so timing does not reveal
+    whether the account exists. Every credential failure feeds the counter; an
+    admission failure with a correct password does not, since that caller
+    already proved ownership of the account.
 
-    Validations:
-    - User must exist.
-    - Password must be correct.
-    - User must be verified.
-    - User must be active (not blocked).
-
-    Workflow:
-    1) Retrieve user by email.
-    2) Verify password (using dummy hash if user not found to prevent timing attacks).
-    3) Check if user is verified.
-    4) Check if user is active.
-    5) Rehash and persist the password if needed.
-    6) Generate access and refresh tokens.
+    Wrong credentials, an unverified account and a blocked account all answer
+    InvalidCredentialsError under one code, by design - the client learns that
+    login failed and nothing else.
 
     Side effects:
-    - Persists password hash updates when rehashing is required.
-    - Token creation handles its own caching.
+    - Appends `user.signed_in` or `user.sign_in_failed` to the event log. The
+      success row is written only once the session exists, so it cannot claim
+      a sign-in whose credentials never reached the caller; a failure commits
+      its row on its own before raising, so the trail of a credential-stuffing
+      run survives the rejection it describes.
+    - Persists a rehashed password when the stored hash uses outdated parameters.
+    - Bumps the user:{id} cache namespace version twice, pre- and post-commit.
+      Every write to the user row does this unconditionally, this one included,
+      where the row is only sometimes touched - so no one has to remember an
+      exception to the rule.
 
     Errors:
-    - InstanceProcessingException: if credentials are invalid or the user is not verified.
-    - PermissionDeniedException: if the user is blocked.
-
-    Returns:
-    - TokenModel with access and refresh tokens.
+    - TooManyRequestsException: the email has exhausted its failure window.
+    - InvalidCredentialsError: wrong credentials, unverified or blocked account.
     """
 
     def __init__(
         self,
-        uow: ApplicationUnitOfWork[RepositoryProtocol],
+        uow: ApplicationUnitOfWork,
         redis_client: Redis,
+        cache: Cache,
     ) -> None:
         self.uow = uow
         self.redis_client = redis_client
+        self.cache = cache
+        self.throttle = LoginThrottle(
+            USER_AUTH_REALM, LOGIN_FAILURES_LIMIT, LOGIN_FAILURES_WINDOW_SECONDS
+        )
 
     async def execute(
         self,
         data: LoginUserModel,
+        ip: str | None = None,
     ) -> TokenModel:
+        # data.email is already normalized by EmailNormalizationMixin, so the
+        # counter key cannot be split across spellings of one address.
+        await self.throttle.ensure_under_limit(data.email, self.redis_client)
+
         async with self.uow as uow:
             user = await uow.users.get_single(uow.session, email=data.email)
             if not user:
@@ -79,8 +105,17 @@ class LoginUserUseCase:
                     "[LoginUser] User with email '%s' not found.",
                     mask_email(data.email),
                 )
-                await verify_password(data.password, INVALID_CREDENTIALS_PASSWORD_HASH)
-                raise InstanceProcessingException(INVALID_CREDENTIALS_MESSAGE)
+                await verify_password(data.password, DUMMY_PASSWORD_HASH)
+                await self.throttle.record_failure(data.email, self.redis_client)
+                # Nothing else is pending, so this commit carries only the
+                # failed attempt; the error still reaches the caller.
+                await uow.event_logs.record(
+                    uow.session,
+                    Actor.anonymous(ip=ip),
+                    UserSignInFailed(email=data.email, reason="unknown_email"),
+                )
+                await uow.commit()
+                raise InvalidCredentialsError(INVALID_CREDENTIALS_MESSAGE)
 
             correct_password = await verify_password(data.password, user.password_hash)
             if not correct_password:
@@ -88,61 +123,86 @@ class LoginUserUseCase:
                     "[LoginUser] Incorrect password for user '%s'",
                     mask_email(data.email),
                 )
-                raise InstanceProcessingException(INVALID_CREDENTIALS_MESSAGE)
-
-            if not user.is_verified:
-                logger.debug(
-                    "[LoginUser] User with email '%s' not verified.",
-                    mask_email(data.email),
+                await self.throttle.record_failure(data.email, self.redis_client)
+                # Anonymous, not the account owner: the password did not
+                # match, so nothing here proves who made the attempt.
+                await uow.event_logs.record(
+                    uow.session,
+                    Actor.anonymous(ip=ip),
+                    UserSignInFailed(email=data.email, reason="wrong_password"),
                 )
-                raise InstanceProcessingException("User is not verified")
+                await uow.commit()
+                raise InvalidCredentialsError(INVALID_CREDENTIALS_MESSAGE)
 
-            if not user.is_active:
+            violation = account_access_violation(user)
+            if violation is not None:
                 logger.debug(
-                    "[LoginUser] User with email '%s' is blocked.",
+                    "[LoginUser] Account of '%s' fails admission (%s).",
                     mask_email(data.email),
+                    violation,
                 )
-                raise PermissionDeniedException("User is blocked")
+                # The password already matched, so this attempt is the
+                # account owner's and the row is attributed to them.
+                await uow.event_logs.record(
+                    uow.session,
+                    Actor.user(user.id, ip=ip),
+                    UserSignInFailed(email=data.email, reason=violation),
+                )
+                await uow.commit()
+                # Raised here rather than after the block: the commit above
+                # completed the UoW, so nothing may touch it again.
+                ensure_can_authenticate(user)
 
             await self._rehash_password_if_needed(uow, user, data.password)
-            await uow.flush()
-            token_data = {"sub": str(user.id)}
-
-            session_id = str(uuid4())
-            family = str(uuid4())
-            await uow.commit()
-            return TokenModel(
-                access_token=await create_access_token(
-                    token_data, redis_client=self.redis_client, session_id=session_id
-                ),
-                refresh_token=await create_refresh_token(
-                    token_data,
-                    redis_client=self.redis_client,
-                    session_id=session_id,
-                    family=family,
-                ),
+            await self.cache.invalidate(user_cache_keys.namespace(user.id))
+            uow.add_after_commit_hook(
+                partial(self.cache.invalidate, user_cache_keys.namespace(user.id))
             )
+            # The session is issued before the row that records it, and the
+            # commit is the last thing that happens: a Redis failure in either
+            # call below must leave no `user.signed_in` claiming a sign-in the
+            # caller never got credentials for. The reverse order costs less -
+            # a commit failure here strands a session in Redis that nothing can
+            # reach, since its tokens only exist in a response that never
+            # arrives, and it expires on its own.
+            tokens = await issue_session_pair(
+                realm=USER_AUTH_REALM,
+                subject_id=str(user.id),
+                claims={},
+                redis_client=self.redis_client,
+            )
+            await self.throttle.clear(data.email, self.redis_client)
+            await uow.event_logs.record(
+                uow.session,
+                Actor.user(user.id, ip=ip),
+                UserSignedIn(object_id=user.id),
+            )
+            await uow.commit()
+            return tokens
 
     async def _rehash_password_if_needed(
         self,
-        uow: ApplicationUnitOfWork[RepositoryProtocol],
+        uow: ApplicationUnitOfWork,
         user: User,
         raw_password: str,
     ) -> None:
         if not needs_password_rehash(user.password_hash):
             return
+        new_hash = await hash_password(raw_password)
         await uow.users.update(
             uow.session,
-            {"password_hash": hash_password(raw_password)},
+            {"password_hash": new_hash},
             id=user.id,
         )
 
 
 def get_login_user_use_case(
-    uow: ApplicationUnitOfWork[RepositoryProtocol] = Depends(get_unit_of_work),
-    redis_client: Redis = Depends(get_redis_client),
+    uow: Annotated[ApplicationUnitOfWork, Depends(get_unit_of_work)],
+    redis_client: Annotated[Redis, Depends(get_redis_client)],
+    cache: Annotated[Cache, Depends(get_cache)],
 ) -> LoginUserUseCase:
     return LoginUserUseCase(
         uow=uow,
         redis_client=redis_client,
+        cache=cache,
     )

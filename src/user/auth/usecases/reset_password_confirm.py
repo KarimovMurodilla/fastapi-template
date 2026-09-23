@@ -1,120 +1,141 @@
+from functools import partial
+from typing import Annotated
+
 from fastapi import Depends
 import jwt
 from redis.asyncio import Redis
 
 from loggers import get_logger
+from src.core.auth.one_time_tokens import decode_one_time_token
+from src.core.auth.token_helpers import invalidate_all_sessions
+from src.core.cache.interface import Cache
+from src.core.cache.runtime import get_cache
 from src.core.database.session import get_unit_of_work
-from src.core.database.uow import ApplicationUnitOfWork, RepositoryProtocol
+from src.core.database.uow import ApplicationUnitOfWork
+from src.core.errors.exceptions import UnauthorizedException
 from src.core.redis.dependencies import get_redis_client
 from src.core.schemas import SuccessResponse
 from src.core.utils.security import hash_password, mask_email
-from src.main.config import config
+from src.event_log.actor import Actor
+from src.user.auth.realm import RESET_PASSWORD_PURPOSE, USER_AUTH_REALM
 from src.user.auth.schemas import ResetPasswordModel
-from src.user.auth.token_helpers import invalidate_all_user_sessions
+from src.user.cache_keys import user_cache_keys
+from src.user.events import UserPasswordReset
 
 logger = get_logger(__name__)
 
 
 class ResetPasswordConfirmUseCase:
     """
-    Confirm password reset using a valid JWT reset token.
+    Confirm a password reset with a single-use token and store the new password.
 
-    Inputs:
-    - data: ResetPasswordModel containing the token and the new password.
-
-    Validations:
-    - Token must be valid and not expired.
-    - Token mode must be 'reset_password_token'.
-    - Email must be present in the token.
-    - User must exist in the database.
-
-    Workflow:
-    1) Decode and validate the JWT reset token.
-    2) Extract email from the token payload.
-    3) Hash and update the user's password in the database.
-    4) Invalidate all active sessions for the user in Redis.
-    5) Commit the transaction.
+    An invalid, expired or superseded token answers success=False instead of
+    raising, so a wrong token cannot be told apart from a wrong email.
 
     Side effects:
-    - Updates user record in the database.
-    - Deletes user session keys from Redis.
-
-    Errors:
-    - None (returns success=False for invalid tokens/users).
-
-    Returns:
-    - SuccessResponse: success=True if password was reset, False otherwise.
+    - Appends `user.password_reset` to the event log, in this transaction.
+    - Deletes every session key of the user before the commit rather than
+      after: with Redis unavailable the change then fails as a whole, instead
+      of leaving a new password alongside sessions that still hold the old one.
+      The reset token itself is already spent by then - decoding consumes it,
+      so two concurrent submissions of one link cannot both set a password.
+    - Clears the per-email login-failure counter. The reset proves mailbox
+      ownership, so a throttled address must not stay locked out of login.
+    - Bumps the user:{id} cache namespace version twice, pre- and post-commit.
     """
 
     def __init__(
         self,
-        uow: ApplicationUnitOfWork[RepositoryProtocol],
+        uow: ApplicationUnitOfWork,
         redis_client: Redis,
+        cache: Cache,
     ) -> None:
         self.uow = uow
         self.redis_client = redis_client
+        self.cache = cache
 
     async def execute(
         self,
         data: ResetPasswordModel,
+        ip: str | None = None,
     ) -> SuccessResponse:
         async with self.uow as uow:
             try:
-                payload = jwt.decode(
+                normalized_email = await decode_one_time_token(
                     data.token,
-                    config.jwt.JWT_RESET_PASSWORD_SECRET_KEY,
-                    [config.jwt.ALGORITHM],
+                    realm=USER_AUTH_REALM,
+                    purpose=RESET_PASSWORD_PURPOSE,
+                    redis_client=self.redis_client,
+                    expected_mode="reset_password_token",
                 )
 
-                if payload.get("mode") == "reset_password_token":
-                    email = payload.get("email")
-                    if not email:
-                        logger.info("[ResetPasswordConfirm] Email not found in token.")
-                        return SuccessResponse(success=False)
-
-                    user = await uow.users.update(
-                        uow.session,
-                        {"password_hash": hash_password(data.password)},
-                        email=email,
-                    )
-                    await uow.flush()
-                    if not user:
-                        logger.info(
-                            "[ResetPasswordConfirm] User with email %s not found.",
-                            mask_email(email),
-                        )
-                        return SuccessResponse(success=False)
-
-                    await invalidate_all_user_sessions(str(user.id), self.redis_client)
-                    logger.debug(
-                        "[ResetPasswordConfirm] All user %s sessions invalidated.",
-                        mask_email(email),
-                    )
-                    await uow.commit()
+                new_password_hash = await hash_password(data.password)
+                user = await uow.users.update(
+                    uow.session,
+                    {"password_hash": new_password_hash},
+                    email=normalized_email,
+                )
+                if not user:
                     logger.info(
-                        "[ResetPasswordConfirm] Successfully changed password for user "
-                        "with email %s.",
-                        mask_email(email),
+                        "[ResetPasswordConfirm] User with email %s not found.",
+                        mask_email(normalized_email),
                     )
-                    return SuccessResponse(success=True)
-                else:
-                    logger.info("[ResetPasswordConfirm] Invalid token mode.")
                     return SuccessResponse(success=False)
+
+                await uow.flush()
+                await invalidate_all_sessions(
+                    str(user.id), self.redis_client, keys=USER_AUTH_REALM.keys
+                )
+                # A successful reset proves mailbox ownership: clear the
+                # login-failure throttle so an attacker who filled the window
+                # with wrong passwords cannot keep the real owner locked out.
+                await self.redis_client.delete(
+                    USER_AUTH_REALM.keys.login_failures(normalized_email)
+                )
+                await self.cache.invalidate(user_cache_keys.namespace(user.id))
+                uow.add_after_commit_hook(
+                    partial(self.cache.invalidate, user_cache_keys.namespace(user.id))
+                )
+                # Attributed to the account: the spent token proved the caller
+                # reads its mailbox. Whether that caller is the owner is what
+                # the preceding `user.password_reset_requested` row helps answer.
+                await uow.event_logs.record(
+                    uow.session,
+                    Actor.user(user.id, ip=ip),
+                    UserPasswordReset(object_id=user.id),
+                )
+                await uow.commit()
+                logger.debug(
+                    "[ResetPasswordConfirm] All user %s sessions invalidated.",
+                    mask_email(normalized_email),
+                )
+                logger.info(
+                    "[ResetPasswordConfirm] Successfully changed password for user "
+                    "with email %s.",
+                    mask_email(normalized_email),
+                )
+                return SuccessResponse(success=True)
+
+            except UnauthorizedException:
+                logger.info("[ResetPasswordConfirm] Token JTI is inactive or invalid.")
+                return SuccessResponse(success=False)
 
             except jwt.ExpiredSignatureError:
                 logger.info("[ResetPasswordConfirm] Token has expired.")
                 return SuccessResponse(success=False)
 
             except jwt.InvalidTokenError:
-                logger.info("[ResetPasswordConfirm] Token is invalid. Ema")
+                logger.info("[ResetPasswordConfirm] Token is invalid.")
                 return SuccessResponse(success=False)
 
 
 def get_reset_password_confirm_use_case(
-    uow: ApplicationUnitOfWork[RepositoryProtocol] = Depends(get_unit_of_work),
-    redis_client: Redis = Depends(get_redis_client),
+    uow: Annotated[ApplicationUnitOfWork, Depends(get_unit_of_work)],
+    redis_client: Annotated[Redis, Depends(get_redis_client)],
+    cache: Annotated[Cache, Depends(get_cache)],
 ) -> ResetPasswordConfirmUseCase:
     return ResetPasswordConfirmUseCase(
         uow=uow,
         redis_client=redis_client,
+        cache=cache,
     )

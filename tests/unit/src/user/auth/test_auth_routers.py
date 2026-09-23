@@ -1,0 +1,553 @@
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import AsyncMock
+
+from fastapi.routing import APIRoute
+import pytest
+
+from src.core.auth.credentials import SessionIdentity
+from src.core.auth.jwt_payload_schema import JWTPayload
+from src.core.database.session import get_unit_of_work
+from src.core.limiter.depends import RateLimiter
+from src.core.redis.dependencies import get_redis_client
+from src.core.schemas import SuccessResponse, TokenModel
+from src.user.auth.dependencies import (
+    get_access_by_refresh_token,
+    get_logout_identity,
+    verify_csrf,
+)
+from src.user.auth.realm import USER_AUTH_REALM
+from src.user.auth.routers import router
+from src.user.auth.usecases.login import get_login_user_use_case
+from src.user.auth.usecases.logout import get_logout_use_case
+from src.user.auth.usecases.refresh_access import get_refresh_access_use_case
+from src.user.auth.usecases.register import get_register_use_case
+from src.user.auth.usecases.resend_verification import get_send_verification_use_case
+from src.user.auth.usecases.reset_password_confirm import (
+    get_reset_password_confirm_use_case,
+)
+from src.user.auth.usecases.reset_password_request import (
+    get_reset_password_request_use_case,
+)
+from src.user.auth.usecases.verify_email import get_verify_email_use_case
+from src.user.schemas import UserProfileViewModel
+from tests.factories.token_factory import (
+    build_access_payload,
+    build_refresh_payload,
+    encode_access_payload,
+)
+from tests.factories.user_factory import build_user
+from tests.fakes.db import FakeAsyncSession, FakeUnitOfWork
+from tests.fakes.redis import InMemoryRedis
+from tests.helpers.limiter import noop_rate_limiter
+from tests.helpers.overrides import DependencyOverrides
+from tests.helpers.providers import ProvideAsyncValue, ProvideValue
+
+REFRESH_COOKIE_NAME = USER_AUTH_REALM.refresh_cookie
+CSRF_COOKIE_NAME = USER_AUTH_REALM.csrf_cookie
+
+
+class FakeUseCase:
+    def __init__(self, result) -> None:
+        self.execute = AsyncMock(return_value=result)
+
+
+class FakeUserRepository:
+    def __init__(self, user) -> None:
+        self.get_single = AsyncMock(return_value=user)
+
+
+def _get_auth_route(*, path: str, method: str) -> APIRoute:
+    for route in router.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        if route.path == path and method in route.methods:
+            return route
+
+    raise AssertionError(f"Route {method} {path} not found")
+
+
+def _get_route_rate_limiters(route: APIRoute) -> list[RateLimiter]:
+    return [
+        dependency.call
+        for dependency in route.dependant.dependencies
+        if isinstance(dependency.call, RateLimiter)
+    ]
+
+
+def _get_route_dependency_calls(route: APIRoute) -> list[Any]:
+    """Every callable the route resolves, route-level and nested alike.
+
+    A gate declared on a sub-dependency counts as declared on the route, so the
+    whole tree is walked rather than only its first level.
+    """
+    calls: list[Any] = []
+    pending = list(route.dependant.dependencies)
+    while pending:
+        dependency = pending.pop()
+        calls.append(dependency.call)
+        pending.extend(dependency.dependencies)
+    return calls
+
+
+@pytest.fixture(autouse=True)
+def disable_rate_limiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.core.limiter.depends.RateLimiter.__call__",
+        noop_rate_limiter,
+    )
+
+
+@pytest.mark.asyncio
+async def test_register_endpoint(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    user = build_user()
+    result = UserProfileViewModel.model_validate(user)
+    dependency_overrides.set(get_register_use_case, ProvideValue(FakeUseCase(result)))
+
+    response = await async_client.post(
+        "/v1/users/auth/register",
+        json={
+            "first_name": "John",
+            "last_name": "Doe",
+            "email": "john@example.com",
+            "username": "john_doe",
+            "phone_number": "+1234567890",
+            "password": "StrongPass1!",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["email"] == user.email
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    tokens = TokenModel(access_token="a", refresh_token="r")
+    dependency_overrides.set(get_login_user_use_case, ProvideValue(FakeUseCase(tokens)))
+
+    response = await async_client.post(
+        "/v1/users/auth/login",
+        json={"email": "user@example.com", "password": "StrongPass1!"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["access_token"] == "a"
+    assert body["refresh_token"] is None
+    assert body["csrf_token"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_endpoint(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    user = build_user()
+    payload: JWTPayload = build_refresh_payload(str(user.id))
+    dependency_overrides.set(get_access_by_refresh_token, ProvideValue((user, payload)))
+    tokens = TokenModel(access_token="a", refresh_token="r")
+    dependency_overrides.set(
+        get_refresh_access_use_case, ProvideValue(FakeUseCase(tokens))
+    )
+
+    # The route-level CSRF gate resolves the refresh credentials itself, so a request
+    # must actually carry a token even when get_access_by_refresh_token is stubbed.
+    # The header path is the one that needs no CSRF token.
+    response = await async_client.post(
+        "/v1/users/auth/login/refresh",
+        headers={"Authorization": "header-refresh-token"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["access_token"] == "a"
+    assert body["refresh_token"] is None
+    assert body["csrf_token"]
+
+
+@pytest.mark.asyncio
+async def test_login_of_blocked_user_masks_the_reason(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+    fake_redis: InMemoryRedis,
+) -> None:
+    # The real LoginUserUseCase must run here (not FakeUseCase) so the assertion
+    # proves the route surfaces exactly what the use case raises for a blocked
+    # account - the same masked response as any other invalid credentials.
+    user = build_user(is_active=False)
+    uow = FakeUnitOfWork(
+        session=FakeAsyncSession(),
+        repositories={"users": FakeUserRepository(user)},
+    )
+    dependency_overrides.set(get_unit_of_work, ProvideAsyncValue(uow))
+    dependency_overrides.set(get_redis_client, ProvideValue(fake_redis))
+
+    response = await async_client.post(
+        "/v1/users/auth/login",
+        json={"email": user.email, "password": "password"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "code": "invalid_credentials",
+        "message": "Incorrect email or password.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_refresh_of_blocked_user_reports_user_blocked(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+    fake_redis: InMemoryRedis,
+) -> None:
+    # The real RefreshAccessUseCase must run here too: a caller who already
+    # holds a valid refresh token gets the real reason, unlike login.
+    user = build_user(is_active=False)
+    payload: JWTPayload = build_refresh_payload(str(user.id))
+    dependency_overrides.set(get_access_by_refresh_token, ProvideValue((user, payload)))
+    dependency_overrides.set(get_redis_client, ProvideValue(fake_redis))
+
+    response = await async_client.post(
+        "/v1/users/auth/login/refresh",
+        headers={"Authorization": "header-refresh-token"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "user_blocked", "message": "User is blocked"}
+
+
+@pytest.mark.asyncio
+async def test_refresh_of_unverified_user_reports_user_not_verified(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+    fake_redis: InMemoryRedis,
+) -> None:
+    user = build_user(is_verified=False)
+    payload: JWTPayload = build_refresh_payload(str(user.id))
+    dependency_overrides.set(get_access_by_refresh_token, ProvideValue((user, payload)))
+    dependency_overrides.set(get_redis_client, ProvideValue(fake_redis))
+
+    response = await async_client.post(
+        "/v1/users/auth/login/refresh",
+        headers={"Authorization": "header-refresh-token"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "code": "user_not_verified",
+        "message": "User is not verified",
+    }
+
+
+@pytest.mark.asyncio
+async def test_logout_endpoint(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    user = build_user()
+    dependency_overrides.set(
+        get_logout_identity,
+        ProvideValue(SessionIdentity(subject_id=str(user.id), session_id="session-1")),
+    )
+    logout_use_case = FakeUseCase(SuccessResponse(success=True))
+    dependency_overrides.set(get_logout_use_case, ProvideValue(logout_use_case))
+
+    response = await async_client.post("/v1/users/auth/logout")
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+    logout_use_case.execute.assert_awaited_once_with(
+        identity=SessionIdentity(subject_id=str(user.id), session_id="session-1"),
+        terminate_all_sessions=False,
+        ip="127.0.0.1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_logout_endpoint_expires_both_auth_cookies(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    # A logout that leaves the auth cookies in place is a silent security regression:
+    # the browser would keep replaying a refresh token the server has already retired.
+    user = build_user()
+    dependency_overrides.set(
+        get_logout_identity,
+        ProvideValue(SessionIdentity(subject_id=str(user.id), session_id="session-1")),
+    )
+    dependency_overrides.set(
+        get_logout_use_case, ProvideValue(FakeUseCase(SuccessResponse(success=True)))
+    )
+
+    response = await async_client.post("/v1/users/auth/logout")
+
+    assert response.status_code == 200
+    set_cookie = response.headers.get_list("set-cookie")
+    refresh_header = next(
+        h for h in set_cookie if h.startswith(f"{REFRESH_COOKIE_NAME}=")
+    )
+    csrf_header = next(h for h in set_cookie if h.startswith(f"{CSRF_COOKIE_NAME}="))
+    assert "Max-Age=0" in refresh_header
+    assert "Max-Age=0" in csrf_header
+
+
+@pytest.mark.asyncio
+async def test_logout_with_body_transport_writes_no_cookies(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    user = build_user()
+    dependency_overrides.set(
+        get_logout_identity,
+        ProvideValue(SessionIdentity(subject_id=str(user.id), session_id="session-1")),
+    )
+    dependency_overrides.set(
+        get_logout_use_case, ProvideValue(FakeUseCase(SuccessResponse(success=True)))
+    )
+
+    response = await async_client.post(
+        "/v1/users/auth/logout", headers={"X-Token-Transport": "body"}
+    )
+
+    assert response.status_code == 200
+    assert response.headers.get_list("set-cookie") == []
+
+
+@pytest.mark.asyncio
+async def test_logout_endpoint_can_terminate_all_sessions(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    user = build_user()
+    dependency_overrides.set(
+        get_logout_identity,
+        ProvideValue(SessionIdentity(subject_id=str(user.id), session_id="session-1")),
+    )
+    logout_use_case = FakeUseCase(SuccessResponse(success=True))
+    dependency_overrides.set(get_logout_use_case, ProvideValue(logout_use_case))
+
+    response = await async_client.post(
+        "/v1/users/auth/logout",
+        json={"terminate_all_sessions": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+    logout_use_case.execute.assert_awaited_once_with(
+        identity=SessionIdentity(subject_id=str(user.id), session_id="session-1"),
+        terminate_all_sessions=True,
+        ip="127.0.0.1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_verification_email_endpoint(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    dependency_overrides.set(
+        get_send_verification_use_case,
+        ProvideValue(FakeUseCase(SuccessResponse(success=True))),
+    )
+
+    response = await async_client.post(
+        "/v1/users/auth/verification-email",
+        json={"email": "user@example.com"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_verify_email_endpoint(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    dependency_overrides.set(
+        get_verify_email_use_case,
+        ProvideValue(FakeUseCase(SuccessResponse(success=True))),
+    )
+
+    response = await async_client.post("/v1/users/auth/verify", json={"token": "t"})
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_verify_email_rejects_get(async_client) -> None:
+    # The token is a credential: a GET puts it in access logs, proxies and the
+    # Referer header, so only the POST form exists.
+    response = await async_client.get("/v1/users/auth/verify", params={"token": "t"})
+
+    assert response.status_code == 405
+
+
+def test_verify_email_route_has_rate_limit() -> None:
+    route = _get_auth_route(path="/verify", method="POST")
+
+    rate_limiters = _get_route_rate_limiters(route)
+
+    assert len(rate_limiters) == 1
+    assert rate_limiters[0].times == 30
+    assert rate_limiters[0].milliseconds == 15 * 60_000
+
+
+def test_logout_route_has_no_csrf_gate() -> None:
+    """verify_csrf resolves a refresh token first, and none reaches this route.
+
+    The refresh cookie is path-scoped to the refresh endpoint, so a browser
+    arrives at logout with its access token in the Authorization header - the
+    one transport the double submit skips. The gate would check nothing here
+    and would 401 the credential-less logout, which exists so a client can shed
+    the httponly cookies it cannot clear itself.
+    """
+    logout_dependencies = _get_route_dependency_calls(
+        _get_auth_route(path="/logout", method="POST")
+    )
+    # The refresh route is the control: a walker that found nothing would pass
+    # the logout assertion for the wrong reason.
+    refresh_dependencies = _get_route_dependency_calls(
+        _get_auth_route(path="/login/refresh", method="POST")
+    )
+
+    assert verify_csrf not in logout_dependencies
+    assert verify_csrf in refresh_dependencies
+
+
+def test_logout_route_has_rate_limit() -> None:
+    route = _get_auth_route(path="/logout", method="POST")
+
+    rate_limiters = _get_route_rate_limiters(route)
+
+    assert len(rate_limiters) == 1
+    assert rate_limiters[0].times == 20
+    assert rate_limiters[0].milliseconds == 60_000
+
+
+def test_login_route_rate_limit_tolerates_shared_ips() -> None:
+    # Per-IP only: CGNAT and offices put many users behind one address, so the
+    # limit is loose here and the per-email soft throttle does the precise work.
+    route = _get_auth_route(path="/login", method="POST")
+
+    rate_limiters = _get_route_rate_limiters(route)
+
+    assert len(rate_limiters) == 1
+    assert rate_limiters[0].times == 5
+    assert rate_limiters[0].milliseconds == 60_000
+
+
+@pytest.mark.asyncio
+async def test_reset_password_request_endpoint(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    dependency_overrides.set(
+        get_reset_password_request_use_case,
+        ProvideValue(FakeUseCase(SuccessResponse(success=True))),
+    )
+
+    response = await async_client.post(
+        "/v1/users/auth/password/reset",
+        json={"email": "user@example.com"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_reset_password_confirm_endpoint(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    dependency_overrides.set(
+        get_reset_password_confirm_use_case,
+        ProvideValue(FakeUseCase(SuccessResponse(success=True))),
+    )
+
+    response = await async_client.put(
+        "/v1/users/auth/password/reset/confirm",
+        json={"token": "t", "password": "StrongPass1!"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+
+
+def test_reset_password_request_route_has_rate_limit() -> None:
+    route = _get_auth_route(path="/password/reset", method="POST")
+
+    rate_limiters = _get_route_rate_limiters(route)
+
+    assert len(rate_limiters) == 1
+    assert rate_limiters[0].times == 3
+    assert rate_limiters[0].milliseconds == 15 * 60_000
+
+
+def test_reset_password_confirm_route_has_rate_limit() -> None:
+    route = _get_auth_route(path="/password/reset/confirm", method="PUT")
+
+    rate_limiters = _get_route_rate_limiters(route)
+
+    assert len(rate_limiters) == 1
+    assert rate_limiters[0].times == 5
+    assert rate_limiters[0].milliseconds == 15 * 60_000
+
+
+@pytest.mark.asyncio
+async def test_logout_with_an_expired_access_token_still_clears_the_cookies(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    # The identity dependency is deliberately not overridden here: the expired token
+    # has to survive the real dependency, or a cookie-transport client that lets its
+    # access token lapse can never log out and cannot drop the httponly cookie itself.
+    logout_use_case = FakeUseCase(SuccessResponse(success=True))
+    dependency_overrides.set(get_logout_use_case, ProvideValue(logout_use_case))
+    token = encode_access_payload(
+        build_access_payload("user-1", session_id="session-1", expires_in_minutes=-10)
+    )
+
+    response = await async_client.post(
+        "/v1/users/auth/logout", headers={"Authorization": token}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+    logout_use_case.execute.assert_awaited_once_with(
+        identity=SessionIdentity(subject_id="user-1", session_id="session-1"),
+        terminate_all_sessions=False,
+        ip="127.0.0.1",
+    )
+    set_cookie = response.headers.get_list("set-cookie")
+    refresh_header = next(
+        h for h in set_cookie if h.startswith(f"{REFRESH_COOKIE_NAME}=")
+    )
+    csrf_header = next(h for h in set_cookie if h.startswith(f"{CSRF_COOKIE_NAME}="))
+    assert "Max-Age=0" in refresh_header
+    assert "Max-Age=0" in csrf_header
+
+
+@pytest.mark.asyncio
+async def test_logout_without_credentials_clears_cookies_and_revokes_nothing(
+    async_client,
+    dependency_overrides: DependencyOverrides,
+) -> None:
+    logout_use_case = FakeUseCase(SuccessResponse(success=True))
+    dependency_overrides.set(get_logout_use_case, ProvideValue(logout_use_case))
+
+    response = await async_client.post("/v1/users/auth/logout")
+
+    assert response.status_code == 200
+    logout_use_case.execute.assert_not_awaited()
+    set_cookie = response.headers.get_list("set-cookie")
+    assert any(h.startswith(f"{REFRESH_COOKIE_NAME}=") for h in set_cookie)

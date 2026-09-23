@@ -1,47 +1,102 @@
-from collections.abc import Awaitable
-import logging
+import asyncio
 
 from redis.asyncio import Redis
-import sentry_sdk
-from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.errors.exceptions import InfrastructureException
+from loggers import get_logger
+from src.core.errors.exceptions import ServiceUnavailableException
+from src.system.repositories import SystemRepository
 from src.system.schemas import HealthCheckResponse
+
+logger = get_logger(__name__)
+
+# A probe must answer in bounded time. Without this it inherits the request
+# pool's 30s pool_timeout, so a saturated pool leaves the load balancer waiting
+# half a minute before hearing anything at all.
+POSTGRES_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+class ReadinessService:
+    """
+    Backs /ready/, and owns the PostgreSQL probe both probes share.
+
+    Separate from HealthService so that readiness depends on PostgreSQL and
+    nothing else: a Redis outage must never be able to pull every instance out
+    of the load balancer.
+    """
+
+    def __init__(self, repository: SystemRepository, session: AsyncSession) -> None:
+        self.repository = repository
+        self.session = session
+
+    async def ensure_ready(self) -> None:
+        """
+        Gate readiness on PostgreSQL only - the single dependency without which
+        the service cannot answer any meaningful request.
+
+        Raises:
+            ServiceUnavailableException: PostgreSQL is unreachable, or the
+                request pool cannot hand out a connection within the probe
+                timeout (HTTP 503). Not logged here: the handler logs every
+                503 once, and a polling probe must not log an outage twice.
+        """
+        if not await self.check_postgres():
+            raise ServiceUnavailableException(
+                "Readiness check failed: PostgreSQL is unreachable",
+                additional_info={"postgres": False},
+            )
+
+    async def check_postgres(self) -> bool:
+        """
+        Catches everything on purpose: a host that does not resolve reaches the
+        probe as a bare socket.gaierror from the driver, never wrapped into
+        SQLAlchemyError, and a probe that raises on an unreachable database
+        defeats its own point.
+        """
+        try:
+            async with asyncio.timeout(POSTGRES_PROBE_TIMEOUT_SECONDS):
+                await self.repository.ping(self.session)
+            return True
+        except Exception as exc:
+            logger.warning("Postgres health check failed: %s", exc)
+            return False
 
 
 class HealthService:
-    def __init__(self, redis_client: Redis) -> None:
-        self.redis_client = redis_client
-        self.logger = logging.getLogger(__name__)
+    """
+    Owns the detailed per-dependency report served at /health/.
 
-    async def get_status(self, session: AsyncSession) -> HealthCheckResponse:
+    Neither this nor ReadinessService reports to Sentry. They run on a timer,
+    so a single outage would file one event per poll, and the outage is what
+    infrastructure alerting watches anyway. Redis degradation that actually
+    affects traffic is reported once, with a cooldown, by the rate limiter
+    fallback.
+    """
+
+    def __init__(self, redis_client: Redis, readiness: ReadinessService) -> None:
+        self.redis_client = redis_client
+        self.readiness = readiness
+
+    async def get_status(self) -> HealthCheckResponse:
+        """
+        Report the state of every dependency.
+
+        Never raises: this is the endpoint monitoring reads to find out *which*
+        dependency is down, so it must keep answering with a body exactly when
+        something is broken. /ready/ is what turns a Postgres outage into a 503.
+        """
+        postgres_is_ok = await self.readiness.check_postgres()
         redis_is_ok = await self._check_redis()
-        postgres_is_ok = await self._check_postgres(session)
-        if not redis_is_ok or not postgres_is_ok:
-            raise InfrastructureException(
-                "System health check failed",
-                additional_info={"redis": redis_is_ok, "postgres": postgres_is_ok},
-            )
-        return HealthCheckResponse(status="ok")
+        is_healthy = postgres_is_ok and redis_is_ok
+        return HealthCheckResponse(
+            status="ok" if is_healthy else "degraded",
+            postgres=postgres_is_ok,
+            redis=redis_is_ok,
+        )
 
     async def _check_redis(self) -> bool:
         try:
-            ping_result = self.redis_client.ping()
-            if isinstance(ping_result, Awaitable):
-                return bool(await ping_result)
-            return bool(ping_result)
+            return bool(await self.redis_client.ping())
         except Exception as exc:
-            self.logger.error("Redis health check failed", exc_info=exc)
-            sentry_sdk.capture_exception(exc)
-            return False
-
-    async def _check_postgres(self, session: AsyncSession) -> bool:
-        try:
-            await session.execute(text("SELECT 1"))
-            return True
-        except SQLAlchemyError as exc:
-            self.logger.error("Postgres health check failed", exc_info=exc)
-            sentry_sdk.capture_exception(exc)
+            logger.warning("Redis health check failed: %s", exc)
             return False

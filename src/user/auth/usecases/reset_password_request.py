@@ -1,56 +1,49 @@
+from typing import Annotated
+
 from fastapi import Depends
-from starlette.datastructures import URL
 
 from loggers import get_logger
 from src.core.database.session import get_unit_of_work
-from src.core.database.uow import ApplicationUnitOfWork, RepositoryProtocol
+from src.core.database.uow import ApplicationUnitOfWork
+from src.core.errors.exceptions import InstanceProcessingException
 from src.core.schemas import SuccessResponse
-from src.core.utils.security import build_email_throttle_key, mask_email
+from src.core.utils.security import mask_email
+from src.event_log.actor import Actor
+from src.user.auth.realm import USER_AUTH_REALM
 from src.user.auth.schemas import SendResetPasswordRequestModel
-from src.user.auth.services.reset_password_notifier import (
-    ResetPasswordNotifier,
+from src.user.auth.services.email_notifier import (
+    EmailNotifier,
     get_reset_password_notifier,
 )
+from src.user.events import UserPasswordResetRequested
 
 logger = get_logger(__name__)
 
 
 class ResetPasswordRequestUseCase:
     """
-    Request a password reset email for a user.
+    Send a password reset email.
 
-    Inputs:
-    - data: SendResetPasswordRequestModel containing user email.
-    - request_base_url: The base URL for the password reset link.
-
-    Validations:
-    - User must exist (if not, return success to prevent email enumeration).
-
-    Workflow:
-    1) Retrieve user by email.
-    2) If user exists, send password reset email using the notifier with throttling.
+    Answers success whether or not anything was sent, the unelapsed throttle
+    window included: a caller must not be able to tell an unknown address from
+    one that was mailed a minute ago. The throttle key is released when the
+    transaction fails to commit.
 
     Side effects:
-    - Sends an external email notification.
-    - Sets/updates a throttle key in Redis.
-
-    Errors:
-    - InfrastructureException: if email sending fails.
-
-    Returns:
-    - SuccessResponse: success=True regardless of whether email was sent.
+    - Appends `user.password_reset_requested` to the event log when an email
+      is actually queued.
     """
 
     def __init__(
         self,
-        uow: ApplicationUnitOfWork[RepositoryProtocol],
-        notifier: ResetPasswordNotifier,
+        uow: ApplicationUnitOfWork,
+        notifier: EmailNotifier,
     ) -> None:
         self.uow = uow
         self.notifier = notifier
 
     async def execute(
-        self, data: SendResetPasswordRequestModel, request_base_url: URL
+        self, data: SendResetPasswordRequestModel, ip: str | None = None
     ) -> SuccessResponse:
         async with self.uow as uow:
             user = await uow.users.get_single(uow.session, email=data.email)
@@ -61,12 +54,37 @@ class ResetPasswordRequestUseCase:
                 )
                 return SuccessResponse(success=True)
 
-            throttle_key = build_email_throttle_key("password-reset", user.email)
-            await self.notifier.send_password_reset_email(
-                user=user,
-                base_url=request_base_url,
-                throttle_key=throttle_key,
+            throttle_key = USER_AUTH_REALM.keys.throttle("password-reset", user.email)
+            try:
+                await self.notifier.send(
+                    uow=uow,
+                    user=user,
+                    throttle_key=throttle_key,
+                )
+            except InstanceProcessingException:
+                logger.debug(
+                    "[ResetPasswordRequest] Skip sending to email '%s' due to throttle",
+                    mask_email(data.email),
+                )
+                return SuccessResponse(success=True)
+
+            # Anonymous: anyone may type an address into that form, and this
+            # row is what later tells a takeover attempt from a forgotten
+            # password. The throttled and unknown-address branches above
+            # return before it - neither queued an email.
+            await uow.event_logs.record(
+                uow.session,
+                Actor.anonymous(ip=ip),
+                UserPasswordResetRequested(object_id=user.id),
             )
+            try:
+                await uow.commit()
+            except Exception:
+                # The rollback discards the outbox row, but the throttle key in
+                # Redis survives it: release it so a retry is not locked out
+                # for the full TTL with no email queued.
+                await self.notifier.release_throttle(throttle_key)
+                raise
 
             logger.info(
                 "[ResetPasswordRequest] Reset password email successfully sent to %s",
@@ -76,7 +94,7 @@ class ResetPasswordRequestUseCase:
 
 
 def get_reset_password_request_use_case(
-    uow: ApplicationUnitOfWork[RepositoryProtocol] = Depends(get_unit_of_work),
-    notifier: ResetPasswordNotifier = Depends(get_reset_password_notifier),
+    uow: Annotated[ApplicationUnitOfWork, Depends(get_unit_of_work)],
+    notifier: Annotated[EmailNotifier, Depends(get_reset_password_notifier)],
 ) -> ResetPasswordRequestUseCase:
     return ResetPasswordRequestUseCase(uow=uow, notifier=notifier)

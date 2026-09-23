@@ -2,7 +2,7 @@ name: Pre-commit Autoupdate
 
 on:
   schedule:
-    - cron: "20 6 * * 1"
+    - cron: "20 6 3 * *"
   workflow_dispatch:
 
 permissions:
@@ -21,10 +21,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -45,7 +45,7 @@ jobs:
         run: |
           set -euo pipefail
           pre-commit autoupdate
-          python scripts/sync_precommit_mypy_deps.py
+          python scripts/ops/sync_precommit_deps.py
           pre-commit validate-config
 
       - name: Create or update pull request
@@ -68,7 +68,7 @@ jobs:
 
       - name: Close superseded pull requests
         if: steps.create_pr.outputs.pull-request-operation == 'created'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.PRECOMMIT_BOT_TOKEN || github.token }}
           script: |

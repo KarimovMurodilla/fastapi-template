@@ -7,40 +7,45 @@ from src.core.schemas import (
 )
 from src.core.validations import (
     FULL_NAME_PATTERN,
-    PHONE_NUMBER_MIN_LENGTH,
-    PHONE_NUMBER_REGEX,
+    PHONE_NUMBER_PATTERN,
     USERNAME_VALIDATOR,
 )
 
 
 class CreateUserModel(StrongPasswordValidationMixin, EmailNormalizationMixin, Base):
-    first_name: str
-    last_name: str
+    first_name: str = Field(min_length=2, max_length=30)
+    last_name: str = Field(min_length=2, max_length=30)
     email: EmailStr
     username: str
-    phone_number: str = Field(min_length=PHONE_NUMBER_MIN_LENGTH)
+    phone_number: str
     password: str
 
     @field_validator("first_name")
     @classmethod
     def validate_first_name(cls, value: str) -> str:
         if not FULL_NAME_PATTERN.match(value):
-            raise ValueError("First name must contain latin letters and spaces only")
+            raise ValueError(
+                "First name must contain latin letters, with single spaces, "
+                "hyphens or apostrophes between parts"
+            )
         return value
 
     @field_validator("last_name")
     @classmethod
     def validate_last_name(cls, value: str) -> str:
         if not FULL_NAME_PATTERN.match(value):
-            raise ValueError("Last name must contain latin letters and spaces only")
+            raise ValueError(
+                "Last name must contain latin letters, with single spaces, "
+                "hyphens or apostrophes between parts"
+            )
         return value
 
     @field_validator("phone_number")
     @classmethod
     def validate_phone_number(cls, value: str) -> str:
-        if not PHONE_NUMBER_REGEX.match(value):
+        if not PHONE_NUMBER_PATTERN.match(value):
             raise ValueError(
-                "Phone number must contain only digits (optionally starting with '+') and be 5–20 characters long."
+                "Phone number must be in E.164 format: '+' followed by 2-15 digits"
             )
         return value
 
@@ -58,6 +63,10 @@ class ResendVerificationModel(EmailNormalizationMixin, Base):
     email: EmailStr
 
 
+class VerifyEmailRequestModel(Base):
+    token: str
+
+
 class LoginUserModel(EmailNormalizationMixin, Base):
     email: EmailStr
     password: str
@@ -67,10 +76,15 @@ class SendResetPasswordRequestModel(EmailNormalizationMixin, Base):
     email: EmailStr
 
 
+class LogoutRequestModel(Base):
+    terminate_all_sessions: bool = False
+
+
 class ResetPasswordModel(StrongPasswordValidationMixin, Base):
     token: str
     password: str
 
 
 class UserNewPassword(StrongPasswordValidationMixin, Base):
+    current_password: str
     password: str

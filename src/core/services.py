@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Load
 
 from src.core.database.base import Base as SQLAlchemyBase
+from src.core.database.query import ListQuery
 from src.core.database.repositories import BaseRepository
 from src.core.errors.exceptions import InstanceNotFoundException
 from src.core.pagination import (
@@ -17,20 +18,20 @@ from src.core.schemas import Base as PydanticBase
 
 ModelType = TypeVar("ModelType", bound=SQLAlchemyBase)
 CreateSchema = TypeVar("CreateSchema", bound=PydanticBase)
-UpdateSchema = TypeVar("UpdateSchema", bound=PydanticBase)
-RepositoryType = TypeVar("RepositoryType", bound=BaseRepository)  # type: ignore
+RepositoryType = TypeVar("RepositoryType", bound=BaseRepository[Any])
 ResponseSchema = TypeVar("ResponseSchema", bound=PydanticBase)
 
 
-class BaseService(
-    Generic[ModelType, CreateSchema, UpdateSchema, RepositoryType, ResponseSchema]
-):
+class BaseService(Generic[ModelType, CreateSchema, RepositoryType, ResponseSchema]):
     """
     Lightweight generic service that wraps a repository to perform straightforward CRUD operations.
 
     Use this service only for simple, stateless cases without complicated custom business logic, cross-aggregate
     coordination, or multi-step workflows. Write methods (create/update/delete) commit automatically,
     so changes are persisted immediately.
+
+    The session is constructor-injected by the DI provider that builds the service (never passed
+    in from a router or a call site), and every CRUD method forwards it to the repository as-is.
 
     For any non-trivial flows—transactional orchestration across multiple repositories, conditional
     workflows, side effects (e.g., sending emails, cache updates, external API calls), or retries—
@@ -40,36 +41,40 @@ class BaseService(
     def __init__(
         self,
         repository: RepositoryType,
+        session: AsyncSession,
         response_schema: type[ResponseSchema] | None = None,
     ):
         self.repository = repository
+        self.session = session
         self._response_schema = response_schema
 
     async def create(
         self,
-        session: AsyncSession,
         data: CreateSchema,
     ) -> ModelType:
         """Create a new record."""
         result = await self.repository.create(
-            session=session, data=data.model_dump(), commit=True
+            session=self.session, data=data.model_dump(), commit=True
         )
         return cast(ModelType, result)
 
     async def get_single(
         self,
-        session: AsyncSession,
         eager: list[Load] | None = None,
         **filters: Any,
     ) -> ModelType | None:
         """Retrieve a single record matching the filters."""
-        return await self.repository.get_single(session=session, eager=eager, **filters)
+        return await self.repository.get_single(
+            session=self.session, eager=eager, **filters
+        )
 
     async def get_single_or_404(
-        self, session: AsyncSession, eager: list[Load] | None = None, **filters: Any
+        self, eager: list[Load] | None = None, **filters: Any
     ) -> ModelType:
         """Retrieve a single record matching the filters or raise a 404 error."""
-        obj = await self.repository.get_single(session=session, eager=eager, **filters)
+        obj = await self.repository.get_single(
+            session=self.session, eager=eager, **filters
+        )
         if obj is None:
             raise InstanceNotFoundException(
                 f"{self.repository.model.__name__} not found"
@@ -78,26 +83,28 @@ class BaseService(
 
     async def get_list(
         self,
-        session: AsyncSession,
         eager: list[Load] | None = None,
         **filters: Any,
     ) -> list[ModelType]:
         """Retrieve a list of records matching the filters."""
-        return await self.repository.get_list(session=session, eager=eager, **filters)
+        return await self.repository.get_list(
+            session=self.session, eager=eager, **filters
+        )
 
     async def get_paginated_list(
         self,
-        session: AsyncSession,
         pagination: PaginationParams,
         eager: list[Load] | None = None,
+        query: ListQuery | None = None,
         **filters: Any,
     ) -> PaginatedResponse[ResponseSchema]:
         """Retrieve a paginated list of records matching the filters."""
         items, total = await self.repository.get_paginated_list(
-            session=session,
+            session=self.session,
             page=pagination.page,
             size=pagination.size,
             eager=eager,
+            query=query,
             **filters,
         )
         schema_to_use: type[ResponseSchema] | None = self._response_schema
@@ -113,18 +120,19 @@ class BaseService(
 
     async def update(
         self,
-        session: AsyncSession,
-        data: UpdateSchema,
+        data: PydanticBase,
         **filters: Any,
     ) -> ModelType | None:
         """Update a record matching the filters."""
         return await self.repository.update(
-            session=session,
+            session=self.session,
             data=data.model_dump(exclude_unset=True),
             **filters,
             commit=True,
         )
 
-    async def delete(self, session: AsyncSession, **filters: Any) -> ModelType | None:
+    async def delete(self, **filters: Any) -> ModelType | None:
         """Delete a record matching the filters."""
-        return await self.repository.delete(session=session, **filters, commit=True)
+        return await self.repository.delete(
+            session=self.session, **filters, commit=True
+        )

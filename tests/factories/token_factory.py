@@ -6,14 +6,16 @@ from uuid import uuid4
 
 import jwt
 
+from src.core.auth.jwt_payload_schema import JWTPayload
+from src.core.auth.one_time_tokens import issue_one_time_token
+from src.core.auth.tokens import create_access_token, create_refresh_token
 from src.core.utils.datetime_utils import get_utc_now
+from src.core.utils.security import normalize_email
 from src.main.config import config
-from src.user.auth.jwt_payload_schema import JWTPayload
-from src.user.auth.security import (
-    create_access_token,
-    create_refresh_token,
-    create_reset_password_token,
-    create_verification_token,
+from src.user.auth.realm import (
+    RESET_PASSWORD_PURPOSE,
+    USER_AUTH_REALM,
+    VERIFICATION_PURPOSE,
 )
 
 
@@ -41,7 +43,6 @@ def build_refresh_payload(
     *,
     session_id: str | None = None,
     jti: str | None = None,
-    family: str | None = None,
     expires_in_minutes: int | None = None,
 ) -> JWTPayload:
     expire = get_utc_now() + timedelta(
@@ -53,7 +54,6 @@ def build_refresh_payload(
         "mode": "refresh_token",
         "jti": jti or str(uuid4()),
         "session_id": session_id or str(uuid4()),
-        "family": family or str(uuid4()),
     }
 
 
@@ -67,7 +67,9 @@ async def build_access_token(
     *,
     session_id: str | None = None,
 ) -> str:
-    return await create_access_token(data, redis_client, session_id=session_id)
+    return await create_access_token(
+        data, redis_client, session_id=session_id, realm=USER_AUTH_REALM
+    )
 
 
 async def build_refresh_token(
@@ -75,16 +77,29 @@ async def build_refresh_token(
     redis_client: Any,
     *,
     session_id: str | None = None,
-    family: str | None = None,
 ) -> str:
     return await create_refresh_token(
-        data, redis_client, session_id=session_id, family=family
+        data, redis_client, session_id=session_id, realm=USER_AUTH_REALM
     )
 
 
-def build_verification_token(data: dict[str, Any]) -> str:
-    return create_verification_token(data)
+async def build_verification_token(data: dict[str, Any], redis_client: Any) -> str:
+    return await issue_one_time_token(
+        realm=USER_AUTH_REALM,
+        purpose=VERIFICATION_PURPOSE,
+        identifier=normalize_email(str(data["email"])),
+        mode="verification_token",
+        ttl_minutes=config.jwt.VERIFICATION_TOKEN_EXPIRE_MINUTES,
+        redis_client=redis_client,
+    )
 
 
-def build_reset_password_token(data: dict[str, Any]) -> str:
-    return create_reset_password_token(data)
+async def build_reset_password_token(data: dict[str, Any], redis_client: Any) -> str:
+    return await issue_one_time_token(
+        realm=USER_AUTH_REALM,
+        purpose=RESET_PASSWORD_PURPOSE,
+        identifier=normalize_email(str(data["email"])),
+        mode="reset_password_token",
+        ttl_minutes=config.jwt.RESET_PASSWORD_TOKEN_EXPIRE_MINUTES,
+        redis_client=redis_client,
+    )

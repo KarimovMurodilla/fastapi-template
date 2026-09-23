@@ -5,6 +5,7 @@ It serves as an entry point for the application's ORM to recognize and manage
 table relationships effectively.
 """
 
-# Import all models here
-
-from src.user.models import User as User  # Re-export the User model explicitly
+from src.core.outbox.models import OutboxMessage as OutboxMessage
+from src.event_log.models import EventLog as EventLog
+from src.note.models import Note as Note
+from src.user.models import User as User

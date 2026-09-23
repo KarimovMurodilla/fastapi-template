@@ -1,11 +1,19 @@
-from collections.abc import AsyncGenerator, Generator
+# ruff: noqa: E402 -- TESTING must be set before any src.* import triggers config load
 import os
 
+os.environ.setdefault("TESTING", "true")
+
+from collections.abc import AsyncGenerator, Generator
+from unittest.mock import AsyncMock
+
 from fastapi import FastAPI
-import httpx
+import httpx2
 import pytest
 import pytest_asyncio
 
+from src.core.cache.memory_cache import InMemoryCache
+from src.core.cache.runtime import get_cache, reset_cache, set_cache
+from src.core.cache.serializer import JsonSerializer
 from src.core.database.session import get_session, get_unit_of_work
 from src.core.email_service.dependencies import get_email_service
 from src.core.email_service.service import EmailService
@@ -13,8 +21,8 @@ from src.core.redis.dependencies import get_redis_client
 from src.core.storage.s3.dependencies import get_s3_adapter
 from src.main.config import Config, get_settings
 from src.main.web import get_application
-from tests.email.mocks import MockMailer
 from tests.fakes.db import FakeAsyncSession, FakeUnitOfWork
+from tests.fakes.email import MockMailer
 from tests.fakes.redis import InMemoryRedis
 from tests.fakes.s3 import InMemoryS3Client
 from tests.helpers.overrides import DependencyOverrides
@@ -23,13 +31,14 @@ from tests.helpers.providers import ProvideAsyncValue, ProvideValue
 
 @pytest.fixture(scope="session")
 def settings() -> Config:
-    os.environ.setdefault("TESTING", "true")
     get_settings.cache_clear()
     return get_settings()
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def app() -> FastAPI:
+    # Built once: `dependency_overrides` restores what a test replaced, and a
+    # test needing a pristine application builds a bare `FastAPI()`.
     return get_application()
 
 
@@ -38,6 +47,21 @@ def dependency_overrides(app: FastAPI) -> Generator[DependencyOverrides]:
     overrides = DependencyOverrides(app)
     yield overrides
     overrides.reset()
+
+
+@pytest.fixture(autouse=True)
+def cache() -> Generator[InMemoryCache]:
+    # Autouse for every test, not only app_with_fakes: @cached_route resolves the
+    # cache via get_cache_instance() at call time, so any test hitting a decorated
+    # route through the plain async_client fixture needs a bound instance too.
+    instance = InMemoryCache(
+        serializer=JsonSerializer(),
+        default_ttl=60,
+        version_ttl=604800,
+    )
+    set_cache(instance)
+    yield instance
+    reset_cache()
 
 
 @pytest.fixture
@@ -56,8 +80,13 @@ def mock_mailer() -> MockMailer:
 
 
 @pytest.fixture
-def email_service(mock_mailer: MockMailer) -> EmailService:
-    return EmailService(mock_mailer)
+def email_dispatcher() -> AsyncMock:
+    return AsyncMock()
+
+
+@pytest.fixture
+def email_service(mock_mailer: MockMailer, email_dispatcher: AsyncMock) -> EmailService:
+    return EmailService(mock_mailer, email_dispatcher)
 
 
 @pytest.fixture
@@ -80,6 +109,7 @@ def app_with_fakes(
     fake_session: FakeAsyncSession,
     fake_uow: FakeUnitOfWork,
     settings: Config,
+    cache: InMemoryCache,
 ) -> FastAPI:
     dependency_overrides.set(get_redis_client, ProvideValue(fake_redis))
     dependency_overrides.set(get_s3_adapter, ProvideAsyncValue(fake_s3))
@@ -87,13 +117,14 @@ def app_with_fakes(
     dependency_overrides.set(get_session, ProvideAsyncValue(fake_session))
     dependency_overrides.set(get_unit_of_work, ProvideAsyncValue(fake_uow))
     dependency_overrides.set(get_settings, ProvideValue(settings))
+    dependency_overrides.set(get_cache, ProvideAsyncValue(cache))
     return app
 
 
 @pytest_asyncio.fixture
-async def async_client(app: FastAPI) -> AsyncGenerator[httpx.AsyncClient]:
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
+async def async_client(app: FastAPI) -> AsyncGenerator[httpx2.AsyncClient]:
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(
         transport=transport, base_url="http://testserver"
     ) as client:
         yield client
@@ -102,9 +133,9 @@ async def async_client(app: FastAPI) -> AsyncGenerator[httpx.AsyncClient]:
 @pytest_asyncio.fixture
 async def async_client_with_fakes(
     app_with_fakes: FastAPI,
-) -> AsyncGenerator[httpx.AsyncClient]:
-    transport = httpx.ASGITransport(app=app_with_fakes)
-    async with httpx.AsyncClient(
+) -> AsyncGenerator[httpx2.AsyncClient]:
+    transport = httpx2.ASGITransport(app=app_with_fakes)
+    async with httpx2.AsyncClient(
         transport=transport, base_url="http://testserver"
     ) as client:
         yield client

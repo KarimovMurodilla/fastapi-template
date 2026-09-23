@@ -1,22 +1,23 @@
 from functools import lru_cache
 import json
-import logging
 import os
-from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
+from urllib.parse import quote, urlparse
 
-from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-logger = logging.getLogger(__name__)
+# Shortest secret the app accepts anywhere. Matches the HMAC-SHA256 block size,
+# which is the weakest signature the JWT algorithm allowlist permits.
+SECRET_MIN_LENGTH = 32
 
 
-class S3Config(BaseModel):
-    S3_BUCKET_NAME: str
-    S3_ACCESS_KEY_ID: str
-    S3_SECRET_ACCESS_KEY: str
-    S3_REGION_NAME: str
-    S3_SAMPLE_URL: str
+class S3Config(BaseSettings):
+    S3_ENABLED: bool = False
+    S3_BUCKET_NAME: str | None = None
+    S3_ACCESS_KEY_ID: str | None = None
+    S3_SECRET_ACCESS_KEY: str | None = None
+    S3_REGION_NAME: str | None = None
     S3_PRE_SIGNED_URL_SECONDS: int = Field(300, gt=0)
     S3_ENDPOINT_URL: str | None = None
     S3_ADDRESSING_STYLE: str | None = None
@@ -30,7 +31,7 @@ class S3Config(BaseModel):
     S3_RETRY_MODE: str = "standard"
     S3_MAX_UPLOAD_SIZE_BYTES: int = Field(20 * 1024 * 1024, gt=0)
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore")
 
     @field_validator(
         "S3_ENDPOINT_URL",
@@ -63,8 +64,26 @@ class S3Config(BaseModel):
     def default_retry_mode(cls, value: str) -> str:
         return value or "standard"
 
+    @model_validator(mode="after")
+    def require_credentials_when_enabled(self) -> "S3Config":
+        if not self.S3_ENABLED:
+            return self
+        missing = [
+            name
+            for name in (
+                "S3_BUCKET_NAME",
+                "S3_ACCESS_KEY_ID",
+                "S3_SECRET_ACCESS_KEY",
+                "S3_REGION_NAME",
+            )
+            if not getattr(self, name)
+        ]
+        if missing:
+            raise ValueError(f"S3_ENABLED=true requires: {', '.join(missing)}")
+        return self
 
-class BroadcastingConfig(BaseModel):
+
+class BroadcastingConfig(BaseSettings):
     EMAIL_SERVER: str
     EMAIL_PORT: int
     EMAIL_PASSWORD: str
@@ -74,84 +93,144 @@ class BroadcastingConfig(BaseModel):
     EMAIL_STARTTLS: bool
     VALIDATE_CERTS: bool
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore")
 
 
-class RedisConfig(BaseModel):
+class RedisConfig(BaseSettings):
     REDIS_HOST: str
     REDIS_PORT: int
     REDIS_PASSWORD: str
     REDIS_DATABASE: str
-    REDIS_CELERY_DATABASE: str = "1"
+    REDIS_TASKS_DATABASE: str = "1"
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore")
 
     @property
     def dsn(self) -> str:
+        # quote(safe="") because generated passwords routinely contain @ / % :
+        # and every URL parser downstream would silently misread the DSN.
         return (
             f"redis://:"
-            f"{self.REDIS_PASSWORD}@"
+            f"{quote(self.REDIS_PASSWORD, safe='')}@"
             f"{self.REDIS_HOST}:"
             f"{self.REDIS_PORT}/"
             f"{self.REDIS_DATABASE}"
         )
 
     @property
-    def celery_dsn(self) -> str:
+    def tasks_dsn(self) -> str:
         return (
             f"redis://:"
-            f"{self.REDIS_PASSWORD}@"
+            f"{quote(self.REDIS_PASSWORD, safe='')}@"
             f"{self.REDIS_HOST}:"
             f"{self.REDIS_PORT}/"
-            f"{self.REDIS_CELERY_DATABASE}"
+            f"{self.REDIS_TASKS_DATABASE}"
         )
 
 
-class RabbitMQConfig(BaseModel):
-    RABBITMQ_HOST: str
-    RABBITMQ_PORT: int
-    RABBITMQ_USER: str
-    RABBITMQ_PASSWORD: str
+class CacheConfig(BaseSettings):
+    CACHE_ENABLED: bool = True
+    CACHE_DEFAULT_TTL: int = Field(60, gt=0)
+    CACHE_VERSION_TTL: int = Field(604800, gt=0)
+    CACHE_KEY_PREFIX: str = "cache"
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore")
 
-    @property
-    def dsn(self) -> str:
-        return (
-            f"amqp://"
-            f"{self.RABBITMQ_USER}:"
-            f"{self.RABBITMQ_PASSWORD}@"
-            f"{self.RABBITMQ_HOST}:"
-            f"{self.RABBITMQ_PORT}//"
-        )
+    @model_validator(mode="after")
+    def validate_ttl_bounds(self) -> "CacheConfig":
+        # Values must die before their namespace version counter, otherwise an
+        # expired counter resets the version to 0 and resurrects stale values.
+        if self.CACHE_DEFAULT_TTL > self.CACHE_VERSION_TTL:
+            raise ValueError("CACHE_DEFAULT_TTL must not exceed CACHE_VERSION_TTL")
+        return self
 
 
-class SentryConfig(BaseModel):
+class SentryConfig(BaseSettings):
     SENTRY_DSN: str | None = None
     SENTRY_ENV: str = "development"
     SENTRY_ENABLED: bool = False
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore")
 
 
-class JWTConfig(BaseModel):
-    JWT_USER_SECRET_KEY: str
-    JWT_VERIFY_SECRET_KEY: str
-    JWT_ADMIN_SECRET_KEY: str
-    JWT_RESET_PASSWORD_SECRET_KEY: str
+class CookieConfig(BaseSettings):
+    """Policy for auth cookies. Applied by TokenCookieResponder."""
 
-    ALGORITHM: str
+    COOKIE_SECURE: bool = True
+    COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
+    COOKIE_DOMAIN: str | None = None
+    CSRF_SECRET_KEY: str = Field(min_length=SECRET_MIN_LENGTH)
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    @field_validator("COOKIE_DOMAIN", mode="before")
+    @classmethod
+    def normalize_optional_domain(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return str(value)
+
+    @model_validator(mode="after")
+    def reject_samesite_none_without_secure(self) -> "CookieConfig":
+        """
+        Fail startup on a combination browsers silently discard.
+
+        A `SameSite=None` cookie without `Secure` is rejected by every modern
+        browser, so the app would boot cleanly and then drop every auth cookie at
+        the client with no server-side signal at all.
+        """
+        if self.COOKIE_SAMESITE == "none" and not self.COOKIE_SECURE:
+            raise ValueError(
+                "COOKIE_SAMESITE=none requires COOKIE_SECURE=true: browsers reject "
+                "a SameSite=None cookie that is not Secure."
+            )
+        return self
+
+
+class JWTConfig(BaseSettings):
+    # A signing key shorter than the HMAC block size weakens HS256 and is almost
+    # always a placeholder left over from .env.example.
+    JWT_USER_SECRET_KEY: str = Field(min_length=SECRET_MIN_LENGTH)
+    JWT_USER_VERIFY_SECRET_KEY: str = Field(min_length=SECRET_MIN_LENGTH)
+    JWT_USER_RESET_PASSWORD_SECRET_KEY: str = Field(min_length=SECRET_MIN_LENGTH)
+
+    ALGORITHM: Literal["HS256", "HS384", "HS512"]
 
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(gt=0)
     REFRESH_TOKEN_EXPIRE_MINUTES: int = Field(gt=0)
-    REFRESH_TOKEN_USED_TTL_SECONDS: int = Field(1_209_600, gt=0)
     VERIFICATION_TOKEN_EXPIRE_MINUTES: int = Field(gt=0)
     RESET_PASSWORD_TOKEN_EXPIRE_MINUTES: int = Field(gt=0)
 
-    model_config = ConfigDict(extra="ignore")
+    # How long after a rotation a replay of the rotated-out refresh token is
+    # treated as a benign double-submit (plain 401) instead of theft (family
+    # wipe). 0 disables the window and makes every replay a wipe. The cost of
+    # the window: when a thief rotates first and the owner's replay lands
+    # inside it, the theft goes undetected and only the owner is logged out -
+    # keep it seconds-short, hence the hard upper bound.
+    REFRESH_TOKEN_REUSE_GRACE_SECONDS: int = Field(10, ge=0, le=60)
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    @model_validator(mode="after")
+    def reject_shared_secrets(self) -> "JWTConfig":
+        """A shared signing secret would let a token minted for one realm or one
+        purpose pass the signature check of another, collapsing the isolation the
+        separate key namespaces buy."""
+        secret_fields = [
+            name for name in type(self).model_fields if name.endswith("_SECRET_KEY")
+        ]
+        seen: dict[str, str] = {}
+        for name in secret_fields:
+            value = str(getattr(self, name))
+            if value in seen:
+                raise ValueError(f"{name} must differ from {seen[value]}")
+            seen[value] = name
+        return self
 
 
-class PostgresConfig(BaseModel):
+class PostgresConfig(BaseSettings):
     DB_ECHO: bool
 
     POSTGRES_USER: str
@@ -160,13 +239,38 @@ class PostgresConfig(BaseModel):
     POSTGRES_PORT: int
     POSTGRES_DB: str
 
-    model_config = ConfigDict(extra="ignore")
+    DB_POOL_SIZE: int = Field(5, gt=0)
+    DB_MAX_OVERFLOW: int = Field(2, ge=0)
+    # Tasks pool size + overflow must cover --max-async-tasks on the worker
+    # command (infra/docker-compose.yml): every concurrent task may hold a
+    # session, and an undersized pool surfaces as pool_timeout errors.
+    DB_TASKS_POOL_SIZE: int = Field(5, gt=0)
+    DB_TASKS_MAX_OVERFLOW: int = Field(15, ge=0)
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    @field_validator("POSTGRES_DB")
+    @classmethod
+    def reject_url_breaking_database_name(cls, value: str) -> str:
+        # SQLAlchemy's make_url treats everything after '?' as the query string
+        # and does not decode the database path segment, so a name with '?' can
+        # be neither passed raw (truncated) nor percent-encoded (renamed).
+        # Every other character survives make_url unchanged and is allowed.
+        if "?" in value:
+            raise ValueError(
+                "POSTGRES_DB must not contain '?': such a name cannot be "
+                "represented in a database URL"
+            )
+        return value
 
     @property
     def dsn_async(self) -> str:
+        # quote(safe="") because generated credentials routinely contain @ / % :
+        # and every URL parser downstream would silently misread the DSN.
         return (
             f"postgresql+asyncpg://"
-            f"{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@"
+            f"{quote(self.POSTGRES_USER, safe='')}:"
+            f"{quote(self.POSTGRES_PASSWORD, safe='')}@"
             f"{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/"
             f"{self.POSTGRES_DB}"
         )
@@ -175,39 +279,32 @@ class PostgresConfig(BaseModel):
     def dsn_sync(self) -> str:
         return (
             f"postgresql://"
-            f"{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@"
+            f"{quote(self.POSTGRES_USER, safe='')}:"
+            f"{quote(self.POSTGRES_PASSWORD, safe='')}@"
             f"{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/"
             f"{self.POSTGRES_DB}"
         )
 
 
-class AdministrationConfig(BaseModel):
-    SUPER_ADMIN_USERNAME: str
-    SUPER_ADMIN_PASSWORD: str
-    SUPER_ADMIN_EMAIL: str
-    SUPER_ADMIN_PHONE: str
-
-    model_config = ConfigDict(extra="ignore")
-
-
-class AppConfig(BaseModel):
+class AppConfig(BaseSettings):
     VERSION: str
     DEBUG: bool = False
     TESTING: bool = False
 
-    LOCAL_TIMEZONE: str
-
+    # Read by loggers/ straight from os.environ, never through this field; it
+    # stays here so startup and check_env keep requiring the key in .env.
     LOG_LEVEL: str
-    LOG_LEVEL_FILE: str
 
-    CORS_ALLOWED_ORIGINS: list[str] = Field(["*"])
-    CORS_ALLOW_CREDENTIALS: bool = True
-    CORS_ALLOWED_METHODS: list[str] = Field(["*"])
-    CORS_ALLOWED_HEADERS: list[str] = Field(["*"])
-    CORS_EXPOSE_HEADERS: list[str] = Field(["*"])
+    # NoDecode: pydantic-settings would otherwise require strict JSON in the
+    # env file; parse_cors_list below accepts a comma/semicolon list too.
+    CORS_ALLOWED_ORIGINS: Annotated[list[str], NoDecode] = Field([])
+    CORS_ALLOWED_CREDENTIALS: bool = True
+    CORS_ALLOWED_METHODS: Annotated[list[str], NoDecode] = Field(["*"])
+    CORS_ALLOWED_HEADERS: Annotated[list[str], NoDecode] = Field(["*"])
+    CORS_EXPOSE_HEADERS: Annotated[list[str], NoDecode] = Field(["*"])
 
     TRUST_PROXY_HEADERS: bool
-    TRUST_PROXY_HOSTS: list[str] = Field(
+    TRUST_PROXY_HOSTS: Annotated[list[str], NoDecode] = Field(
         [
             "127.0.0.1",
             "::1",
@@ -219,18 +316,27 @@ class AppConfig(BaseModel):
     )
 
     PROJECT_NAME: str
-    PROJECT_SECRET_KEY: str
 
-    PING_INTERVAL: int
-    CONNECTION_TTL: int
+    # Origin of the front-end that receives users arriving from an email. Links
+    # are built from it and never from the request, because Host is client input
+    # and a reset link pointed at another domain hands over the account.
+    PUBLIC_BASE_URL: str
+    EMAIL_VERIFY_PATH: str = "/verify-email"
+    PASSWORD_RESET_PATH: str = "/reset-password"
 
-    model_config = ConfigDict(extra="ignore")
+    # Interactive docs stay open in DEBUG. Outside it they are served only when
+    # both credentials are set; unset means the app publishes no docs at all.
+    DOCS_USERNAME: str = ""
+    DOCS_PASSWORD: str = ""
+
+    model_config = SettingsConfigDict(extra="ignore")
 
     @field_validator(
         "CORS_ALLOWED_ORIGINS",
         "CORS_ALLOWED_METHODS",
         "CORS_ALLOWED_HEADERS",
         "CORS_EXPOSE_HEADERS",
+        "TRUST_PROXY_HOSTS",
         mode="before",
     )
     @classmethod
@@ -247,115 +353,137 @@ class AppConfig(BaseModel):
         sep = "," if "," in v else ";"
         return [item.strip() for item in v.split(sep) if item.strip()]
 
+    @field_validator("PUBLIC_BASE_URL")
+    @classmethod
+    def validate_public_base_url(cls, value: str) -> str:
+        url = value.strip().rstrip("/")
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(
+                "PUBLIC_BASE_URL must be an absolute http(s) URL, "
+                "for example https://app.example.com"
+            )
+        if any(char.isspace() for char in url):
+            raise ValueError("PUBLIC_BASE_URL must not contain whitespace")
+        if parsed.query or parsed.fragment:
+            raise ValueError(
+                "PUBLIC_BASE_URL must be an origin with an optional path, "
+                "without a query string or a fragment: the token is appended "
+                "to it as a query parameter"
+            )
+        return url
+
+    @field_validator("EMAIL_VERIFY_PATH", "PASSWORD_RESET_PATH")
+    @classmethod
+    def normalize_public_path(cls, value: str) -> str:
+        return "/" + value.strip().lstrip("/")
+
+    @model_validator(mode="after")
+    def reject_wildcard_origin_with_credentials(self) -> "AppConfig":
+        """
+        Fail startup on the combination that opens the API to every site.
+
+        Starlette answers a wildcard allowlist by echoing the request's own
+        Origin back, so paired with allow_credentials any third-party page can
+        make credentialed cross-origin calls and read the responses. "null" is
+        the same hole wearing a different hat: a sandboxed iframe or a data:
+        document sends `Origin: null`, and any page can open one.
+        """
+        unsafe = {"*", "null"} & {
+            origin.strip().lower() for origin in self.CORS_ALLOWED_ORIGINS
+        }
+        if unsafe and self.CORS_ALLOWED_CREDENTIALS:
+            raise ValueError(
+                f"CORS_ALLOWED_ORIGINS={sorted(unsafe)[0]} cannot be combined "
+                "with CORS_ALLOWED_CREDENTIALS=true: list the front-end origins "
+                "explicitly, or turn credentials off."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def reject_wildcard_proxy_trust(self) -> "AppConfig":
+        """
+        Fail startup when every proxy hop is trusted.
+
+        With a wildcard nothing in the forwarded chain is attacker-free, so the
+        resolver has no honest end to start from and the rate limiter ends up
+        keyed by a value the caller writes. List the edge addresses or ranges
+        instead - for a CDN, the published ranges of that CDN.
+        """
+        if "*" in [host.strip() for host in self.TRUST_PROXY_HOSTS]:
+            raise ValueError(
+                "TRUST_PROXY_HOSTS=* would trust the whole X-Forwarded-For "
+                "chain, which lets any caller pick their own rate-limit "
+                "identity: list the proxy addresses or CIDR ranges instead."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_docs_credentials(self) -> "AppConfig":
+        """
+        Keep the docs password brute-force resistant, or absent.
+
+        Both blank means the docs are simply not published, which is a valid
+        choice. Once they are published, the password is the only thing in
+        front of a full map of the API, so it answers to the same minimum as
+        every other secret. HTTP Basic transports credentials as base64 of a
+        latin-1 string and FastAPI decodes them as ASCII, so a non-ASCII
+        password would lock the operator out with no way to tell why.
+        """
+        if not (self.DOCS_USERNAME or self.DOCS_PASSWORD):
+            return self
+
+        if not (self.DOCS_USERNAME and self.DOCS_PASSWORD):
+            raise ValueError(
+                "DOCS_USERNAME and DOCS_PASSWORD must both be set to publish "
+                "the docs, or both be empty to keep them unpublished."
+            )
+        if len(self.DOCS_PASSWORD) < SECRET_MIN_LENGTH:
+            raise ValueError(
+                f"DOCS_PASSWORD must be at least {SECRET_MIN_LENGTH} characters"
+            )
+        if not (self.DOCS_USERNAME.isascii() and self.DOCS_PASSWORD.isascii()):
+            raise ValueError("DOCS_USERNAME and DOCS_PASSWORD must be ASCII-only")
+        return self
+
 
 class Config(BaseModel):
-    _project_root: Path | None = None
-
     app: AppConfig
     s3: S3Config
     jwt: JWTConfig
     redis: RedisConfig
+    cache: CacheConfig
     sentry: SentryConfig
+    cookie: CookieConfig
     postgres: PostgresConfig
-    rabbitmq: RabbitMQConfig
     broadcasting: BroadcastingConfig
-    administration: AdministrationConfig
 
     model_config = ConfigDict(extra="ignore")
-
-    @property
-    def project_root(self) -> Path:
-        if self._project_root is None:
-            self._project_root = find_project_root_robust()
-        return self._project_root
 
 
 @lru_cache
 def get_settings() -> Config:
     """
-    Cached settings factory. Override in tests via monkeypatching or dependency overrides.
-    """
-    env_filename = ".env.test" if os.getenv("TESTING") == "true" else ".env"
-    env_file_values = dotenv_values(env_filename)
-    merged_env: dict[str, Any] = {
-        k: v
-        for k, v in {**env_file_values, **dict(os.environ)}.items()
-        if v is not None
-    }
+    Cached settings factory. Override in tests via monkeypatching or dependency
+    overrides; a test that changes the environment must call
+    `get_settings.cache_clear()`.
 
+    The env file is chosen per call rather than pinned on the models, so that
+    flipping TESTING (and clearing the cache) reloads from the other file.
+    Environment variables win over the file, as they must in a deploy.
+    """
+    env_file = ".env.test" if os.getenv("TESTING") == "true" else ".env"
     return Config(
-        app=AppConfig(**merged_env),
-        s3=S3Config(**merged_env),
-        jwt=JWTConfig(**merged_env),
-        redis=RedisConfig(**merged_env),
-        sentry=SentryConfig(**merged_env),
-        postgres=PostgresConfig(**merged_env),
-        rabbitmq=RabbitMQConfig(**merged_env),
-        broadcasting=BroadcastingConfig(**merged_env),
-        administration=AdministrationConfig(**merged_env),
+        app=AppConfig(_env_file=env_file),
+        s3=S3Config(_env_file=env_file),
+        jwt=JWTConfig(_env_file=env_file),
+        redis=RedisConfig(_env_file=env_file),
+        cache=CacheConfig(_env_file=env_file),
+        sentry=SentryConfig(_env_file=env_file),
+        cookie=CookieConfig(_env_file=env_file),
+        postgres=PostgresConfig(_env_file=env_file),
+        broadcasting=BroadcastingConfig(_env_file=env_file),
     )
 
 
 config = get_settings()
-
-
-# ----- Config utils ----- #
-def find_project_root_robust(
-    start_path: Path | None = None, max_depth: int = 10
-) -> Path:
-    """
-    A more robust version of find_project_root with configurable parameters.
-
-    Args:
-        start_path: Starting path to search from (defaults to current working directory)
-        max_depth: Maximum number of parent directories to traverse
-
-    Returns:
-        Path: The project root directory if found, otherwise the starting path
-    """
-    if start_path is None:
-        start_path = Path.cwd()
-
-    markers = {
-        ".git": 100,
-        "pyproject.toml": 90,
-        "setup.py": 80,
-        "setup.cfg": 75,
-        "requirements": 70,
-        "Pipfile": 70,
-        "poetry.lock": 70,
-        "README.md": 50,
-        "Makefile": 60,
-    }
-
-    best_match = None
-    best_score = 0
-
-    current_path = start_path
-    depth = 0
-
-    while current_path != current_path.parent and depth < max_depth:
-        score = 0
-        for marker, weight in markers.items():
-            if (current_path / marker).exists():
-                score += weight
-
-        if score > best_score:
-            best_score = score
-            best_match = current_path
-
-        current_path = current_path.parent
-        depth += 1
-
-    if best_match and best_score > 0:
-        logger.info(
-            f"Project root found: {best_match} (confidence score: {best_score})"
-        )
-        return best_match
-
-    logger.error(
-        "No project root found within %s parent directories from %s",
-        max_depth,
-        start_path,
-    )
-    return start_path

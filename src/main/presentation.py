@@ -1,122 +1,58 @@
+from typing import cast
+
 from fastapi import APIRouter, FastAPI
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from src.core.errors.exceptions import (
-    AccessForbiddenException,
-    CoreException,
-    FilteringError,
-    InfrastructureException,
-    InstanceAlreadyExistsException,
-    InstanceNotFoundException,
-    InstanceProcessingException,
-    NotAcceptableException,
-    PayloadTooLargeException,
-    PermissionDeniedException,
-    TooManyRequestsException,
-    UnauthorizedException,
-)
+from src.core.errors.exceptions import CoreException
 from src.core.errors.handlers import (
-    AccessForbiddenExceptionHandler,
-    CoreExceptionHandler,
-    FilteringErrorHandler,
-    InfrastructureExceptionHandler,
-    InstanceAlreadyExistsExceptionHandler,
-    InstanceNotFoundExceptionHandler,
-    InstanceProcessingExceptionHandler,
-    NotAcceptableExceptionHandler,
-    PayloadTooLargeExceptionHandler,
-    PermissionDeniedExceptionHandler,
-    RequestValidationExceptionHandler,
-    TooManyRequestsExceptionHandler,
-    UnauthorizedExceptionHandler,
-    ValidationErrorExceptionHandler,
-    as_exception_handler,
+    HandlerCallable,
+    handle_core_exception,
+    handle_http_exception,
+    handle_request_validation_exception,
+    handle_validation_error,
 )
+from src.event_log import routers as event_log_routers
+from src.note import routers as note_routers
 from src.system import routers as system_routers
-
-# Import routers here
 from src.user import routers as user_routers
+
+EXCEPTION_HANDLERS: tuple[tuple[type[Exception], HandlerCallable], ...] = (
+    # Starlette resolves handlers over the exception's MRO, so this one entry
+    # covers every CoreException subclass, current and future.
+    (CoreException, cast(HandlerCallable, handle_core_exception)),
+    (
+        RequestValidationError,
+        cast(HandlerCallable, handle_request_validation_exception),
+    ),
+    (ValidationError, cast(HandlerCallable, handle_validation_error)),
+    # FastAPI's HTTPException subclasses Starlette's, so this one registration
+    # covers framework-raised exceptions from both (missing credentials,
+    # unmatched routes, wrong methods) that would otherwise bypass the contract.
+    (StarletteHTTPException, cast(HandlerCallable, handle_http_exception)),
+)
 
 
 def include_routers(app: FastAPI) -> None:
-    """
-    Includes API routers into the FastAPI application.
-
-    Parameters:
-        app (FastAPI): The FastAPI application instance to which routers will
-        be added.
-
-    Returns:
-        None
-    """
+    """Mount every domain router under /v1. A new router is added here."""
     v1_router = APIRouter()
     v1_router.include_router(user_routers.router, prefix="/users", tags=["Users"])
+    v1_router.include_router(note_routers.router, prefix="/notes", tags=["Notes"])
+    v1_router.include_router(
+        event_log_routers.router, prefix="/event-logs", tags=["Event log"]
+    )
 
     app.include_router(v1_router, prefix="/v1")
     app.include_router(system_routers.router, tags=["System"])
 
 
 def include_exceptions_handlers(app: FastAPI) -> None:
-    """
-    Registers exception handlers for various custom exceptions with the provided FastAPI
-    application instance.
+    """Register the exception handlers.
 
-    Parameters:
-        app (FastAPI): The FastAPI application instance to which the exception handlers
-        will be added.
-
-    Returns:
-        None
+    A new project exception needs no entry here: the generic handler serializes
+    whatever `status_code`, `error_code` and `log_level` the class declares.
+    Only errors raised outside that hierarchy need one of their own.
     """
-    app.add_exception_handler(
-        InfrastructureException, as_exception_handler(InfrastructureExceptionHandler())
-    )
-    app.add_exception_handler(
-        RequestValidationError,
-        as_exception_handler(RequestValidationExceptionHandler()),
-    )
-    app.add_exception_handler(
-        ValidationError, as_exception_handler(ValidationErrorExceptionHandler())
-    )
-    app.add_exception_handler(
-        InstanceNotFoundException,
-        as_exception_handler(InstanceNotFoundExceptionHandler()),
-    )
-    app.add_exception_handler(
-        InstanceAlreadyExistsException,
-        as_exception_handler(InstanceAlreadyExistsExceptionHandler()),
-    )
-    app.add_exception_handler(
-        InstanceProcessingException,
-        as_exception_handler(InstanceProcessingExceptionHandler()),
-    )
-    app.add_exception_handler(
-        PayloadTooLargeException,
-        as_exception_handler(PayloadTooLargeExceptionHandler()),
-    )
-    app.add_exception_handler(
-        FilteringError, as_exception_handler(FilteringErrorHandler())
-    )
-    app.add_exception_handler(
-        CoreException,
-        as_exception_handler(CoreExceptionHandler()),
-    )
-    app.add_exception_handler(
-        AccessForbiddenException,
-        as_exception_handler(AccessForbiddenExceptionHandler()),
-    )
-    app.add_exception_handler(
-        UnauthorizedException, as_exception_handler(UnauthorizedExceptionHandler())
-    )
-    app.add_exception_handler(
-        NotAcceptableException, as_exception_handler(NotAcceptableExceptionHandler())
-    )
-    app.add_exception_handler(
-        PermissionDeniedException,
-        as_exception_handler(PermissionDeniedExceptionHandler()),
-    )
-    app.add_exception_handler(
-        TooManyRequestsException,
-        as_exception_handler(TooManyRequestsExceptionHandler()),
-    )
+    for exception_type, handler in EXCEPTION_HANDLERS:
+        app.add_exception_handler(exception_type, handler)

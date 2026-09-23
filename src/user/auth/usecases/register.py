@@ -1,15 +1,18 @@
+from typing import Annotated
+
 from fastapi import Depends
-from starlette.datastructures import URL
 
 from loggers import get_logger
 from src.core.database.session import get_unit_of_work
-from src.core.database.uow import ApplicationUnitOfWork, RepositoryProtocol
-from src.core.utils.security import build_email_throttle_key, hash_password
+from src.core.database.uow import ApplicationUnitOfWork
+from src.core.utils.security import hash_password
+from src.event_log.actor import Actor
 from src.user.auth.schemas import CreateUserModel
-from src.user.auth.services.verification_notifier import (
-    VerificationNotifier,
+from src.user.auth.services.email_notifier import (
+    EmailNotifier,
     get_verification_notifier,
 )
+from src.user.events import UserRegistered
 from src.user.schemas import UserProfileViewModel
 
 logger = get_logger(__name__)
@@ -17,70 +20,53 @@ logger = get_logger(__name__)
 
 class RegisterUseCase:
     """
-    Register a new user and send a verification email.
+    Register a user and send the verification email.
 
-    Inputs:
-    - data: CreateUserModel containing user registration details.
-    - request_base_url: The base URL of the request for building verification links.
-
-    Validations:
-    - Email and username must be unique (handled by DB constraints/repository).
-
-    Workflow:
-    1) Create a new user record in the database.
-    2) Flush the session to obtain the user ID.
-    3) Generate a verification link and send it via email.
-    4) Commit the transaction.
+    The email is written to the outbox inside the same transaction as the user
+    row, so a committed registration always has a queued email and a rolled
+    back one never leaves a stray send. A duplicate email or username reaches
+    the database error middleware as an IntegrityError and is answered 409
+    `already_exists` there, not here.
 
     Side effects:
-    - Creates a user record in the database.
-    - Sends an external email notification.
-    - Sets a throttle key in Redis via the notifier.
-
-    Errors:
-    - InstanceAlreadyExistsException: if email or username already exists.
-    - InfrastructureException: if email sending fails.
-
-    Returns:
-    - UserProfileViewModel: the newly created user profile.
+    - Appends `user.registered` to the event log, in this transaction.
     """
 
     def __init__(
         self,
-        uow: ApplicationUnitOfWork[RepositoryProtocol],
-        notifier: VerificationNotifier,
+        uow: ApplicationUnitOfWork,
+        notifier: EmailNotifier,
     ) -> None:
         self.uow = uow
         self.notifier = notifier
 
     async def execute(
-        self, data: CreateUserModel, request_base_url: URL
+        self, data: CreateUserModel, ip: str | None = None
     ) -> UserProfileViewModel:
         async with self.uow as uow:
             user_data = data.model_dump()
             raw_password = user_data.pop("password")
-            user_data["password_hash"] = hash_password(raw_password)
+            user_data["password_hash"] = await hash_password(raw_password)
             user = await uow.users.create(
                 session=uow.session,
                 data=user_data,
             )
-            await uow.flush()
-
-            throttle_key = build_email_throttle_key("signup", user.email)
-            await self.notifier.send_verification(
-                user=user,
-                base_url=request_base_url,
-                throttle_key=throttle_key,
+            # Outbox row rides the same transaction: a rollback cancels the
+            # email, a broker outage no longer fails registration.
+            await self.notifier.send(uow=uow, user=user)
+            # Anonymous: nothing has proved yet that the person filling the
+            # form owns the address they registered with.
+            await uow.event_logs.record(
+                uow.session, Actor.anonymous(ip=ip), UserRegistered(object_id=user.id)
             )
             await uow.commit()
-            logger.info(
-                "[Register User] User '%s' registered successfully.", data.username
-            )
-            return UserProfileViewModel.model_validate(user)
+
+        logger.info("[Register User] User '%s' registered successfully.", data.username)
+        return UserProfileViewModel.model_validate(user)
 
 
 def get_register_use_case(
-    uow: ApplicationUnitOfWork[RepositoryProtocol] = Depends(get_unit_of_work),
-    notifier: VerificationNotifier = Depends(get_verification_notifier),
+    uow: Annotated[ApplicationUnitOfWork, Depends(get_unit_of_work)],
+    notifier: Annotated[EmailNotifier, Depends(get_verification_notifier)],
 ) -> RegisterUseCase:
     return RegisterUseCase(uow=uow, notifier=notifier)

@@ -1,83 +1,68 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import secrets
 
-from passlib.context import CryptContext
+from argon2 import PasswordHasher, extract_parameters
+from argon2.exceptions import InvalidHashError, VerificationError
 from pydantic import EmailStr
 
 from loggers import get_logger
 
 logger = get_logger(__name__)
 
-pwd_context = CryptContext(
-    schemes=["argon2"],
-    deprecated="auto",
-    argon2__memory_cost=65536,  # 64 MB
-    argon2__time_cost=3,
-    argon2__parallelism=2,
+password_hasher = PasswordHasher(
+    memory_cost=65536,  # 64 MB
+    time_cost=3,
+    parallelism=2,
 )
 
+# Every concurrent Argon2 call holds memory_cost (64 MB) for its duration.
+# A dedicated bounded executor caps hashing memory at max_workers * 64 MB
+# no matter how many requests arrive at once; the default executor would
+# allow up to min(32, cpu + 4) simultaneous hashes.
+_password_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="argon2")
 
-def hash_password(password: str) -> str:
-    """
-    Hashes a given plaintext password using a secure hashing algorithm.
+# Computed once at import. Login verifies against it when the user does not
+# exist, so failure timing matches a real password check; it must be a real
+# hash produced with the current parameters.
+DUMMY_PASSWORD_HASH: str = password_hasher.hash("dummy-password")
 
-    This function uses a password hashing context to hash the input password securely.
 
-    Args:
-        password: A plaintext password string to be hashed.
-
-    Returns:
-        The securely hashed password as a string.
-    """
-    return pwd_context.hash(password)
+async def hash_password(password: str) -> str:
+    """Hash a plaintext password with Argon2 off the event loop."""
+    return await asyncio.get_running_loop().run_in_executor(
+        _password_executor, password_hasher.hash, password
+    )
 
 
 def is_password_hash(value: str) -> bool:
-    """
-    Check whether the given value looks like a password hash.
-    """
-    return pwd_context.identify(value) is not None
+    """Check whether the given value is a structurally valid Argon2 hash."""
+    try:
+        extract_parameters(value)
+    except InvalidHashError:
+        return False
+    return True
 
 
 def needs_password_rehash(hashed_password: str) -> bool:
-    """
-    Determines if a hashed password needs to be rehashed to maintain security.
-
-    This function evaluates whether a given hashed password requires rehashing based
-    on the current settings of the password hashing context. Rehashing is necessary
-    if the algorithm, iteration count, or salt length has changed since the password
-    was first hashed.
-
-    Args:
-        hashed_password: The hashed password to be evaluated as a string.
-
-    Returns:
-        bool: True if the hashed password needs to be rehashed, False otherwise.
-    """
-    return pwd_context.needs_update(hashed_password)
+    """True when the hash was made with outdated parameters."""
+    return password_hasher.check_needs_rehash(hashed_password)
 
 
 async def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """
-    Verifies that a text password matches its hashed counterpart.
-
-    :param plain_password: The text password provided by the user.
-    :param hashed_password: The stored hashed password from the database.
-    :return: True if the passwords match, False otherwise.
-    """
+    """Verify a password against its hash off the event loop."""
     try:
-        return await asyncio.to_thread(
-            pwd_context.verify, plain_password, hashed_password
+        return await asyncio.get_running_loop().run_in_executor(
+            _password_executor, password_hasher.verify, hashed_password, plain_password
         )
-    except ValueError:
+    except (VerificationError, InvalidHashError, ValueError):
         return False
 
 
 def generate_otp(length: int = 5) -> str:
-    """
-    Generate a random numeric OTP with a fixed length.
-    """
+    """Digits only, drawn from `secrets` - short enough to retype, so the
+    throttle in front of every OTP flow is what makes it safe, not its entropy."""
     if length <= 0:
         raise ValueError(f"OTP length must be greater than 0, given {length}.")
 
@@ -85,19 +70,11 @@ def generate_otp(length: int = 5) -> str:
 
 
 def mask_email(email: str | EmailStr) -> str:
-    """
-    Masks an email address by replacing part of the local and domain parts
-    with asterisks.
-    Mask pattern: ab***@cd***
+    """Mask an address down to `ab***@cd***` for logs and Sentry.
 
-    Args:
-        email: str
-            A string containing the email address to be masked.
-
-    Returns:
-        str
-            A masked version of the provided email address with part of
-            the local and domain obscured.
+    Never raises. It runs on logging and error paths, where a malformed address
+    must not replace the record it was meant to annotate; anything unparseable
+    masks to `***`.
     """
     try:
         email_str = str(email)
@@ -109,15 +86,24 @@ def mask_email(email: str | EmailStr) -> str:
         return "***"
 
 
-def build_email_throttle_key(prefix: str, email: str | EmailStr) -> str:
+def build_throttle_key(prefix: str, identifier: str) -> str:
     """
-    Builds a Redis throttle key based on a normalized email hash.
+    Build a Redis key that carries a caller identifier without storing it raw.
+
+    The identifier may be an email, a phone number or a login: all of them are
+    personal data that would otherwise show up in SCAN, MONITOR and RDB dumps.
+
+    It is hashed exactly as supplied. Case folding here would be a realm's
+    decision made in the wrong place: for a realm whose logins are
+    case-sensitive it would collapse two distinct principals onto one throttle
+    counter and one challenge slot. Callers normalize first - the user realm
+    does it through EmailNormalizationMixin.
     """
-    email_norm = str(email).lower()
-    digest = hashlib.sha256(email_norm.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
     return f"{prefix}:{digest}"
 
 
 def normalize_email(email: str) -> str:
-    """Normalize an email address."""
+    """Strip surrounding whitespace and case-fold - the one canonical form
+    stored, compared and hashed into throttle keys."""
     return email.strip().lower()

@@ -3,8 +3,7 @@ updates:
   - package-ecosystem: "pip"
     directory: "/infra/requirements"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "UTC"
     open-pull-requests-limit: 5
@@ -21,8 +20,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "UTC"
     open-pull-requests-limit: 5
@@ -36,10 +34,9 @@ updates:
         patterns:
           - "*"
   - package-ecosystem: "docker"
-    directory: "/infra/docker"
+    directory: "/infra/postgres"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "UTC"
     open-pull-requests-limit: 5
@@ -53,10 +50,34 @@ updates:
         patterns:
           - "*"
   - package-ecosystem: "docker"
-    directory: "/infra/postgres"
+    directory: "/infra/docker"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "Chore:"
+      include: "scope"
+    # The Python minor line is a deliberate choice shared with the CI matrix
+    # (.github/workflows/*.yml pin python-version) and the wheels available for
+    # the locked dependencies, so it moves by hand in one commit, never by a bot.
+    # Base-image rebuilds inside the line (security patches) still come through.
+    ignore:
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+    groups:
+      docker-images:
+        patterns:
+          - "*"
+  - package-ecosystem: "docker-compose"
+    directory: "/infra"
+    schedule:
+      interval: "monthly"
       time: "06:00"
       timezone: "UTC"
     open-pull-requests-limit: 5
@@ -66,6 +87,6 @@ updates:
       prefix: "Chore:"
       include: "scope"
     groups:
-      docker-images:
+      docker-compose-images:
         patterns:
           - "*"

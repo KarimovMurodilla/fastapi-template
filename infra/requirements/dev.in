@@ -3,16 +3,19 @@
 # Development tools
 black
 mypy
-pre-commit
 pip-tools
+pre-commit
 
 # Testing dependencies
+httpx2
 pytest
 pytest-asyncio
 pytest-cov
+taskiq[reload]
 
 # Type stubs
-types-passlib
-types-pytz
+types-PyYAML
+types-requests
+types-ujson
 
 websockets

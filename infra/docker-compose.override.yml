@@ -1,26 +1,59 @@
 # Do not deploy this file on server, it is only for local development
+#
+# Every service drops the base file's restart policy: on a server the stack
+# must come back by itself, on a laptop it must not. Without this, starting
+# Docker for anything at all resurrects the whole dev stack, and a hung one
+# comes back hung.
 
 services:
   app-builder:
     build:
       context: ..
-      dockerfile: infra/docker/Dockerfile.dev
+      dockerfile: infra/docker/dev.Dockerfile
     image: template-app-dev-image:latest
 
   app:
+    restart: "no"
     container_name: template-app
     image: template-app-dev-image:latest
     command: uvicorn src.main.web:app --host 0.0.0.0 --port ${APP_BACKEND_PORT} --reload
+    # Loopback-only: direct app access (bypassing Nginx) for local debugging.
+    # Never bind backing services to 0.0.0.0 — Docker writes the DOCKER iptables
+    # chain and would bypass UFW. See docs/readme/security.md.
+    ports:
+      - "127.0.0.1:${APP_BACKEND_PORT}:${APP_BACKEND_PORT}"
     volumes:
       - ..:/app
       - /app/.venv
 
-  celery_worker:
+  worker:
+    restart: "no"
     image: template-app-dev-image:latest
-
-  celery_beat:
-    image: template-app-dev-image:latest
-
-  nginx:
+    command: taskiq worker taskiq_worker.app:broker --receiver taskiq_worker.receiver:IdempotencyReceiver --max-async-tasks 20 --reload
     volumes:
-      - ./nginx/dev-nginx.conf:/etc/nginx/conf.d/default.conf
+      - ..:/app
+      - /app/.venv
+
+  scheduler:
+    restart: "no"
+    image: template-app-dev-image:latest
+    volumes:
+      - ..:/app
+      - /app/.venv
+
+  # Dev serves the production nginx config, so the proxy-dependent paths - the
+  # forwarded headers TrustedProxy reads, the body limit, the WebSocket upgrade -
+  # behave locally the way they will on a server. Only the published port differs.
+  nginx:
+    restart: "no"
+    # !override replaces the published ports instead of appending to them: dev keeps
+    # the stack off the privileged ports, where a locally running web server usually
+    # already sits.
+    ports: !override
+      - "8000:80"
+
+  postgres:
+    restart: "no"
+
+  redis:
+    restart: "no"

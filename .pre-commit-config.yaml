@@ -26,27 +26,52 @@ repos:
       - id: requirements-txt-fixer
         exclude: ^infra/requirements/.*\.txt$ # Exclude compiled reqs files
       - id: check-json
+      - id: detect-private-key
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: [ --fix=lf ]
+
+  - repo: local
+    hooks:
+      - id: migration-heads
+        name: single alembic head
+        # Alembic answers this too, but only with the project installed and an
+        # .env in place. A second head is born when two branches that each
+        # added a migration meet, which is long before CI sees the result.
+        entry: python scripts/ops/check_migration_heads.py
+        language: python
+        pass_filenames: false
+        files: ^migrations/versions/
+
+      - id: sort-requirements-in
+        name: sort requirements .in
+        entry: python scripts/ops/sort_requirements_in.py
+        language: python
+        files: ^infra/requirements/.*\.in$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.5
+    rev: v0.16.6
     hooks:
       - id: ruff
         args:
           - --fix
 
   - repo: https://github.com/psf/black
-    rev: 26.3.0
+    rev: 26.5.1
     hooks:
       - id: black
 
   - repo: https://github.com/myint/autoflake
-    rev: v2.3.3
+    rev: v2.4.0
     hooks:
       - id: autoflake
-        args: [ --remove-all-unused-imports, --remove-unused-variables ]
+        # Import removal stays with ruff (F401), which honors noqa and __all__;
+        # autoflake's --remove-all-unused-imports would silently strip re-exports
+        # like the models/__init__.py imports Alembic autogenerate discovers.
+        args: [ --remove-unused-variables ]
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.19.1
+    rev: v2.3.1
     hooks:
       - id: mypy
         args: [
@@ -54,17 +79,46 @@ repos:
           "--non-interactive",
           "--config-file=mypy.ini"
         ]
-        exclude: ^(tests/|migrations/|scripts/)
+        exclude: ^(tests/|migrations/)
         additional_dependencies:
-          - fastapi==0.135.1
-          - pydantic==2.12.5
-          - sqlalchemy==2.0.47
-          - celery==5.6.2
-          - sentry-sdk==2.53.0
-          - pydantic-settings==2.13.1
-          - redis==7.2.1
-          - pytest==9.0.2
-          - alembic==1.18.4
-          - fastapi-mail==1.6.2
-          - types-passlib==1.7.7.20260211
-          - types-pytz==2025.2.0.20251108
+          - aiosmtplib==5.1.2
+          - fastapi==0.141.1
+          - jinja2==3.1.6
+          - pydantic==2.13.5
+          - sqlalchemy==2.0.52
+          - taskiq==0.12.5
+          - taskiq-redis==1.2.3
+          - PyJWT==2.13.0
+          - sentry-sdk==2.68.1
+          - pydantic-settings==2.15.0
+          - redis==8.1.0
+          - pytest==9.1.1
+          - alembic==1.19.1
+          - argon2-cffi==25.1.0
+          - types-PyYAML==6.0.12.20260815
+          - types-requests==2.33.0.20260712
+          - types-ujson==5.10.0.20250822
+
+  # Mirrors CI's `bandit -r src scripts migrations -q`: without it a B-finding
+  # first appears minutes after a push, on a run that is otherwise green.
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
+    hooks:
+      - id: bandit
+        args: [ -q ]
+        files: ^(src|scripts|migrations)/
+
+  # deploy.sh is the single deploy path and firewall rules run as root; nothing
+  # else in this pipeline reads a shell script.
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1-1
+    hooks:
+      - id: shellcheck
+
+  # All the pipeline logic lives in the reusable workflows, and a typo in an
+  # expression or a `needs` entry does not fail there - it silently stops
+  # doing what it was supposed to do.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint

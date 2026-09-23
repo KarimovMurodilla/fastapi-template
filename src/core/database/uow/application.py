@@ -3,44 +3,24 @@ from typing import Any, cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.database.repositories import BaseRepository
-from src.core.database.uow.abstract import R, RepositoryProtocol
 from src.core.database.uow.sqlalchemy import RepositoryInstance, SQLAlchemyUnitOfWork
+from src.core.outbox.repositories import OutboxRepository
+from src.event_log.repositories import EventLogRepository
+from src.note.repositories import NoteRepository
 from src.user.repositories import UserRepository
 
 
-class ApplicationUnitOfWork(SQLAlchemyUnitOfWork[R]):
-    """
-    Application-specific Unit of Work implementation.
-
-    This class extends SQLAlchemyUnitOfWork and provides repository factory methods
-    for all repositories used in the application.
-    """
+class ApplicationUnitOfWork(SQLAlchemyUnitOfWork):
+    """The application's UoW: every repository, reachable as a property."""
 
     def __init__(self, session: AsyncSession):
-        """
-        Initialize the ApplicationUnitOfWork with a SQLAlchemy session.
-
-        Args:
-            session: The SQLAlchemy AsyncSession to use for database operations
-        """
         super().__init__(session)
         self._repositories: dict[type[BaseRepository[Any]], BaseRepository[Any]] = {}
 
     def _get_repository(
         self, repository_type: type[RepositoryInstance]
     ) -> RepositoryInstance:
-        """
-        Get or create a repository of the specified type.
-
-        This method implements a caching mechanism for repositories
-        to avoid creating multiple instances of the same repository.
-
-        Args:
-            repository_type: The repository class to get or create
-
-        Returns:
-            An instance of the specified repository type
-        """
+        # Repositories are stateless; one instance per type per UoW is enough.
         if repository_type not in self._repositories:
             self._repositories[repository_type] = repository_type()
 
@@ -48,27 +28,21 @@ class ApplicationUnitOfWork(SQLAlchemyUnitOfWork[R]):
 
     @property
     def users(self) -> UserRepository:
-        """
-        Get the UserRepository.
-
-        Returns:
-            UserRepository: The user repository
-        """
         return self._get_repository(UserRepository)
 
-    # Add more repository properties as needed
+    @property
+    def outbox(self) -> OutboxRepository:
+        return self._get_repository(OutboxRepository)
+
+    @property
+    def notes(self) -> NoteRepository:
+        return self._get_repository(NoteRepository)
+
+    @property
+    def event_logs(self) -> EventLogRepository:
+        return self._get_repository(EventLogRepository)
 
 
-async def get_uow(session: AsyncSession) -> ApplicationUnitOfWork[RepositoryProtocol]:
-    """
-    Dependency injection function to get an ApplicationUnitOfWork instance.
-    This DI assumes the AsyncSession has already been created and is injected here.
-    This DI can be used as a dependency in tasks etc.
-
-    Args:
-        session: The SQLAlchemy AsyncSession to use for database operations
-
-    Returns:
-        ApplicationUnitOfWork: The UnitOfWork instance
-    """
+async def get_uow(session: AsyncSession) -> ApplicationUnitOfWork:
+    """Build a UoW around an already-created session (tasks, scripts, DI)."""
     return ApplicationUnitOfWork(session)

@@ -1,27 +1,35 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Body, Depends, Request, Response
 
+from src.core.auth.cookies import TokenCookieResponder
+from src.core.auth.credentials import SessionIdentity
+from src.core.auth.jwt_payload_schema import JWTPayload
+from src.core.auth.token_transport import TokenTransport, get_token_transport
+from src.core.auth.usecases.refresh_access import RefreshAccessUseCase
 from src.core.limiter.depends import RateLimiter
+from src.core.request_ip import get_client_ip
 from src.core.schemas import SuccessResponse, TokenModel
 from src.main.config import config
 from src.user.auth.dependencies import (
     get_access_by_refresh_token,
-    get_user_id_from_token,
+    get_logout_identity,
+    get_token_cookie_responder,
+    get_user_id_from_refresh_token,
+    verify_csrf,
 )
-from src.user.auth.jwt_payload_schema import JWTPayload
 from src.user.auth.schemas import (
     CreateUserModel,
     LoginUserModel,
+    LogoutRequestModel,
     ResendVerificationModel,
     ResetPasswordModel,
     SendResetPasswordRequestModel,
-)
-from src.user.auth.usecases.get_access_by_refresh import (
-    GetTokensByRefreshUserUseCase,
-    get_tokens_by_refresh_user_use_case,
+    VerifyEmailRequestModel,
 )
 from src.user.auth.usecases.login import LoginUserUseCase, get_login_user_use_case
+from src.user.auth.usecases.logout import UserLogoutUseCase, get_logout_use_case
+from src.user.auth.usecases.refresh_access import get_refresh_access_use_case
 from src.user.auth.usecases.register import RegisterUseCase, get_register_use_case
 from src.user.auth.usecases.resend_verification import (
     SendVerificationUseCase,
@@ -54,16 +62,14 @@ router = APIRouter()
     dependencies=[Depends(RateLimiter(times=10, minutes=10))],
 )
 async def signup_user(
-    request: Request,
     user_form_data: CreateUserModel,
+    request: Request,
     use_case: Annotated[RegisterUseCase, Depends(get_register_use_case)],
 ) -> UserProfileViewModel:
     """
     Create a new user account.
     """
-    return await use_case.execute(
-        data=user_form_data, request_base_url=request.base_url
-    )
+    return await use_case.execute(data=user_form_data, ip=get_client_ip(request))
 
 
 @router.post(
@@ -76,7 +82,6 @@ async def signup_user(
     ],
 )
 async def send_verification_email(
-    request: Request,
     data: ResendVerificationModel,
     use_case: Annotated[
         SendVerificationUseCase, Depends(get_send_verification_use_case)
@@ -85,89 +90,186 @@ async def send_verification_email(
     """
     Sends the verification link to the user's email.
     """
-    return await use_case.execute(data=data, request_base_url=request.base_url)
+    return await use_case.execute(data=data)
 
 
-@router.get("/verify", status_code=200)
+@router.post(
+    "/verify",
+    status_code=200,
+    # POST, not GET: the token is a credential, and a GET would spread it into
+    # access logs, proxy caches and the Referer header. The limiter bounds an
+    # unauthenticated flood into JWT decode plus a DB round-trip (the signed
+    # token itself is not brute-forceable at any rate a limiter could stop);
+    # 30 per window keeps an office behind one NAT able to onboard a team.
+    dependencies=[Depends(RateLimiter(times=30, minutes=15))],
+)
 async def verify_email(
-    token: str,
+    data: VerifyEmailRequestModel,
+    request: Request,
     use_case: Annotated[VerifyEmailUseCase, Depends(get_verify_email_use_case)],
 ) -> SuccessResponse:
     """
-    Verifies the user's email using the provided token.
+    Verifies the user's email using the token from the verification link.
     """
-    return await use_case.execute(token=token)
+    return await use_case.execute(token=data.token, ip=get_client_ip(request))
 
 
 @router.post(
     "/login",
     response_model=TokenModel,
-    dependencies=[Depends(RateLimiter(times=2, seconds=60))],
+    # Loose on purpose: CGNAT and offices put many users behind one IP, and the
+    # per-email soft throttle in the usecase does the precise anti-stuffing work.
+    dependencies=[Depends(RateLimiter(times=5, seconds=60))],
 )
 async def login_user(
     login_form_data: LoginUserModel,
+    request: Request,
+    response: Response,
+    transport: Annotated[TokenTransport, Depends(get_token_transport)],
+    responder: Annotated[TokenCookieResponder, Depends(get_token_cookie_responder)],
     use_case: Annotated[LoginUserUseCase, Depends(get_login_user_use_case)],
 ) -> TokenModel:
     """
     Authenticate user and return tokens.
+
+    By default the refresh token is returned as an httponly cookie. Native clients
+    that store tokens themselves should send `X-Token-Transport: body` to receive it
+    in the response body instead.
     """
-    return await use_case.execute(data=login_form_data)
+    tokens = await use_case.execute(data=login_form_data, ip=get_client_ip(request))
+    return responder.apply(tokens, response, transport)
 
 
 @router.post(
     "/login/refresh",
     response_model=TokenModel,
     dependencies=[
-        Depends(  # IP-based rate limiting
+        Depends(  # IP-based rate limiting: bounds an unauthenticated flood
             RateLimiter(
                 times=20,
                 minutes=15,
             )
         ),
+        # The CSRF gate must precede the user-scoped limiter: its identifier reads the
+        # refresh cookie and verifies it, so a forged cross-site request would
+        # otherwise burn the victim's refresh budget (and reach reuse detection)
+        # before being rejected. FastAPI caches get_refresh_credentials, so the token
+        # is still resolved only once per request.
+        Depends(verify_csrf),
         Depends(  # User-based rate limiting
             RateLimiter(
                 times=5,
                 minutes=15,
-                identifier=get_user_id_from_token,
+                identifier=get_user_id_from_refresh_token,
             )
         ),
     ],
 )
 async def get_access_by_refresh(
+    response: Response,
     user_and_payload: Annotated[
         tuple[User, JWTPayload], Depends(get_access_by_refresh_token)
     ],
+    transport: Annotated[TokenTransport, Depends(get_token_transport)],
+    responder: Annotated[TokenCookieResponder, Depends(get_token_cookie_responder)],
     use_case: Annotated[
-        GetTokensByRefreshUserUseCase, Depends(get_tokens_by_refresh_user_use_case)
+        RefreshAccessUseCase[User], Depends(get_refresh_access_use_case)
     ],
 ) -> TokenModel:
     """
     Refresh the access token using a valid refresh token.
+
+    Browser clients send the refresh cookie together with the `X-CSRF-Token` header.
+    Native clients send the refresh token in the Authorization header.
     """
     current_user, old_payload = user_and_payload
+    tokens = await use_case.execute(current_user, old_payload)
+    return responder.apply(tokens, response, transport)
 
-    return await use_case.execute(user=current_user, old_token_payload=old_payload)
+
+@router.post(
+    "/logout",
+    response_model=SuccessResponse,
+    # No verify_csrf here: it resolves a refresh token first and answers 401
+    # without one, and the refresh cookie is path-scoped to the refresh route,
+    # so none ever reaches logout. A forged cross-site logout expires two
+    # cookies; ending a session server-side needs a signed access token.
+    #
+    # Logout works with expired credentials, so it is an unauthenticated write
+    # to Redis; the limiter bounds a flood without hindering a real client.
+    dependencies=[Depends(RateLimiter(times=20, minutes=1))],
+)
+async def logout_user(
+    request: Request,
+    response: Response,
+    identity: Annotated[SessionIdentity | None, Depends(get_logout_identity)],
+    transport: Annotated[TokenTransport, Depends(get_token_transport)],
+    responder: Annotated[TokenCookieResponder, Depends(get_token_cookie_responder)],
+    use_case: Annotated[UserLogoutUseCase, Depends(get_logout_use_case)],
+    data: Annotated[LogoutRequestModel | None, Body()] = None,
+) -> SuccessResponse:
+    """
+    Invalidate the current session or all user sessions and clear the auth cookies.
+
+    Works with an expired access token, so a client can always log out.
+    """
+    if identity is not None:
+        await use_case.execute(
+            identity=identity,
+            terminate_all_sessions=(
+                data.terminate_all_sessions if data is not None else False
+            ),
+            ip=get_client_ip(request),
+        )
+    responder.clear(response, transport)
+    return SuccessResponse(success=True)
 
 
 @router.post(
     "/password/reset",
     response_model=SuccessResponse,
+    dependencies=[
+        Depends(
+            RateLimiter(
+                times=3,
+                minutes=15,
+            )
+        )
+    ],
 )
 async def send_reset_password_request(
-    request: Request,
     data: SendResetPasswordRequestModel,
+    request: Request,
     use_case: Annotated[
         ResetPasswordRequestUseCase, Depends(get_reset_password_request_use_case)
     ],
 ) -> SuccessResponse:
-    return await use_case.execute(data=data, request_base_url=request.base_url)
+    """
+    Sends a password reset link to the user's email.
+    """
+    return await use_case.execute(data=data, ip=get_client_ip(request))
 
 
-@router.put("/password/reset/confirm", response_model=SuccessResponse)
+@router.put(
+    "/password/reset/confirm",
+    response_model=SuccessResponse,
+    dependencies=[
+        Depends(
+            RateLimiter(
+                times=5,
+                minutes=15,
+            )
+        )
+    ],
+)
 async def confirm_reset_password_request(
     data: ResetPasswordModel,
+    request: Request,
     use_case: Annotated[
         ResetPasswordConfirmUseCase, Depends(get_reset_password_confirm_use_case)
     ],
 ) -> SuccessResponse:
-    return await use_case.execute(data=data)
+    """
+    Sets a new password using a valid password reset token.
+    """
+    return await use_case.execute(data=data, ip=get_client_ip(request))
